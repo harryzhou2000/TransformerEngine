@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include "transformer_engine.h"
+#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {
@@ -334,6 +335,21 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
                        const NVTETensor beta, NVTETensor workspace_setup,
                        NVTETensor workspace_cublas, NVTEGroupedMatmulConfig config,
                        cudaStream_t stream);
+
+/* Device-initiated CUTLASS grouped GEMM for SM100a */
+void nvte_device_cutlass_grouped_gemm(const NVTETensor* A, const void** B_and_SF_addrs, NVTETensor* D,
+                               const int64_t* m_splits, const int gemm_n, const NVTETensor* bias,
+                               NVTETensor* pre_gelu_out, const int num_gemms, bool transa,
+                               bool transb, bool grad, NVTETensor* workspace, size_t workspaceSize,
+                               bool use_split_accumulator, int math_sm_count,
+                               cudaStream_t stream);
+
+void nvte_device_cutlass_grouped_gemm_wgrad(const NVTETensor* A, const NVTETensor* B, void** D,
+                                     transformer_engine::DType D_type, const int64_t* m_splits, const NVTETensor* bias,
+                                     NVTETensor* pre_gelu_out, const int num_gemms, bool transa,
+                                     bool transb, NVTETensor* workspace, size_t workspaceSize,
+                                     bool accumulate, bool* accumulate_mask, bool use_split_accumulator,
+                                     int math_sm_count, cudaStream_t stream);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -346,8 +346,8 @@ void nvte_grouped_gemm(const NVTEGroupedTensor A, int transa, const NVTEGroupedT
  *  - `D = GELU(AB + bias)` if both `bias` and `pre_gelu_out` are not empty tensors
  *  Note: bias and GELU are not supported yet.
  *
- *  \param[in]     A                     The list of A matrices.
- *  \param[in]     B_and_SF_addrs        The list of B and SF matrices addresses.
+ *  \param[in]     A_and_SF_addrs        The list of A and SF matrices addresses.
+ *  \param[in]     B                     The list of B matrices.
  *  \param[in,out] D                     List of output matrices.
  *  \param[in]     m_splits              List of m-dimension splits.
  *  \param[in]     gemm_n                GEMM n dimension.

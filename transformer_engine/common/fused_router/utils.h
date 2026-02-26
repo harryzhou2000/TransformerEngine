@@ -256,8 +256,8 @@ __device__ inline void naive_topk_and_mask(CompType *scores, int data_size, int 
     }
     // Warp shuffle between threads
     for (int s = 16; s > 0; s /= 2) {
-      volatile auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
-      volatile auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
+      auto shuffled_val = __shfl_xor_sync(0xffffffff, val, s);
+      auto shuffled_index = __shfl_xor_sync(0xffffffff, index, s);
       if (shuffled_val > val) {
         val = shuffled_val;
         index = shuffled_index;

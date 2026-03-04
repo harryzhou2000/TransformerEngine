@@ -325,7 +325,7 @@ def test_topk_softmax(
 
 @pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("num_tokens", [2048, 7168])
-@pytest.mark.parametrize("num_experts", [256, 128, 32])
+@pytest.mark.parametrize("num_experts", [3000, 256, 128, 32])
 @pytest.mark.parametrize("topk", [1, 4, 8])
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
 def test_fused_scores_for_aux_loss(dtype, num_tokens, num_experts, topk, score_function):
@@ -377,7 +377,7 @@ def test_fused_scores_for_aux_loss(dtype, num_tokens, num_experts, topk, score_f
 
 @pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("num_tokens", [2048, 7168, 14234])
-@pytest.mark.parametrize("num_experts", [256, 128, 32])
+@pytest.mark.parametrize("num_experts", [3000, 256, 128, 32])
 @pytest.mark.parametrize("topk", [4])
 def test_fused_moe_aux_loss(dtype, num_tokens, num_experts, topk):
     # Construct the special probs to avoid inf in the sigmoid function

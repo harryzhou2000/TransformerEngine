@@ -6,6 +6,7 @@
 
 #include <assert.h>
 #include <cuda_runtime.h>
+#include <sstream>
 #include <transformer_engine/fused_router.h>
 
 #include "../common.h"
@@ -182,10 +183,10 @@ __global__ void fused_topk_with_score_function_forward_kernel(
         }
       }
       __syncwarp();
-      naive_topk_and_mask(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      naive_topk_and_mask_v1(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
 
     } else {
-      naive_topk_and_mask(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      naive_topk_and_mask_v1(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
     }
     __syncwarp();
 
@@ -253,6 +254,18 @@ void fused_topk_with_score_function_forward_kernel_launcher(
     shared_memory_size += num_groups * num_token_per_block * sizeof(DataType);   // group_scores
     shared_memory_size += num_experts * num_token_per_block * sizeof(DataType);  // maksed_scores
   }
+
+  // {
+  //   std::stringstream oss;
+  //   oss << "[fused_topk_fwd] " << "num_tokens=" << num_tokens << ", num_experts=" << num_experts
+  //       << ", topk=" << topk << ", use_pre_softmax=" << use_pre_softmax
+  //       << ", num_groups=" << num_groups << ", group_topk=" << group_topk
+  //       << ", scaling_factor=" << scaling_factor << ", score_function=" << score_function
+  //       << ", grid_size=" << grid_size << ", num_token_per_block=" << num_token_per_block
+  //       << ", shared_memory_size=" << shared_memory_size << " bytes";
+  //   NVTE_WARN(oss.str());
+  // }
+
   cudaFuncSetAttribute(fused_topk_with_score_function_forward_kernel<DataType, BiasType>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size);
   fused_topk_with_score_function_forward_kernel<DataType, BiasType>

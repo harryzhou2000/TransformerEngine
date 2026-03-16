@@ -38,19 +38,19 @@ template <typename T>
 __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncType type,
                                          int lane_id) {
   T (*reduce_func)(T, T);
-  double default_val = 0;
+  float default_val = 0;
   if (type == ReduceFuncType::SUM) {
     reduce_func = sum;
     default_val = 0;
   } else if (type == ReduceFuncType::MAX) {
     reduce_func = max;
-    default_val = -std::numeric_limits<double>::infinity();
+    default_val = -std::numeric_limits<float>::infinity();
   }
 
-  // Some value is hanlded in local thread
+  // Some value is handled in local thread
   // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
   // Reduce the value in local thread
-  volatile double val = lane_id < data_size ? static_cast<double>(data_ptr[lane_id]) : default_val;
+  float val = lane_id < data_size ? static_cast<float>(data_ptr[lane_id]) : default_val;
   for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
     val = reduce_func(val, data_ptr[i]);
   }
@@ -76,20 +76,20 @@ template <typename T>
 __device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int data_size,
                                                 ReduceFuncType type, int lane_id) {
   T (*reduce_func)(T, T);
-  double default_val = 0;
+  float default_val = 0;
   if (type == ReduceFuncType::SUM) {
     reduce_func = sum;
     default_val = 0;
   } else if (type == ReduceFuncType::MAX) {
     reduce_func = max;
-    default_val = -std::numeric_limits<double>::infinity();
+    default_val = -std::numeric_limits<float>::infinity();
   }
 
-  // Some value is hanlded in local thread
+  // Some value is handled in local thread
   // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
   // Reduce the value in local thread
-  volatile double val =
-      lane_id < data_size && mask[lane_id] ? static_cast<double>(data_ptr[lane_id]) : default_val;
+  float val =
+      lane_id < data_size && mask[lane_id] ? static_cast<float>(data_ptr[lane_id]) : default_val;
   for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
     if (mask[i]) {
       val = reduce_func(val, data_ptr[i]);
@@ -110,8 +110,8 @@ template <typename DataType>
 __device__ inline void apply_sigmoid_bwd_on_float(DataType *grad, DataType *fwd_output,
                                                   int data_size, int lane_id) {
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    grad[i] = static_cast<double>(grad[i]) * static_cast<double>(fwd_output[i]) *
-              (1 - static_cast<double>(fwd_output[i]));
+    grad[i] = static_cast<float>(grad[i]) * static_cast<float>(fwd_output[i]) *
+              (1.0f - static_cast<float>(fwd_output[i]));
   }
 }
 
@@ -150,368 +150,296 @@ __device__ inline void apply_softmax_bwd_on_float(DataType *grad, DataType *fwd_
   }
 }
 
+/*******************************************************************************
+ * Online softmax — fused max + exp + sum in a single pass over shmem.
+ *   sum_exp *= exp(old_max - new_max)
+ *
+ * After the single pass, a warp-level reduction merges (max, sum_exp) across
+ * all 32 lanes.  Then a second pass normalizes in-place.
+ *
+ * Result: 2 passes over shmem instead of 4 (read once, write once).
+ ******************************************************************************/
+
 template <typename DataType>
 __device__ inline void apply_softmax_on_float(DataType *scores, int data_size, int lane_id) {
-  // 1. compute the max of value
-  float max_val =
-      static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::MAX, lane_id));
-  // 2. value -> exp_value
+  // --- Pass 1: Online accumulation of max and sum_exp ---
+  float local_max = -std::numeric_limits<float>::infinity();
+  float local_sum = 0.0f;
+
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = static_cast<float>(exp(static_cast<float>(scores[i]) - max_val));
+    float val = static_cast<float>(scores[i]);
+    if (val > local_max) {
+      // Rescale accumulated sum for the new max
+      local_sum *= expf(local_max - val);
+      local_max = val;
+    }
+    local_sum += expf(val - local_max);
   }
-  __syncwarp();
-  // 3. compute the sum of exp_value
-  float sum_val =
-      static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::SUM, lane_id));
-  // 4. update the softmax value
+
+  // Warp-level reduction of (max, sum_exp) across 32 lanes.
+  // When merging two lanes with (max_a, sum_a) and (max_b, sum_b):
+  //   merged_max = max(max_a, max_b)
+  //   merged_sum = sum_a * exp(max_a - merged_max) + sum_b * exp(max_b - merged_max)
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float other_max = __shfl_xor_sync(0xffffffff, local_max, offset);
+    float other_sum = __shfl_xor_sync(0xffffffff, local_sum, offset);
+    float new_max = fmaxf(local_max, other_max);
+    local_sum = local_sum * expf(local_max - new_max) + other_sum * expf(other_max - new_max);
+    local_max = new_max;
+  }
+  // After reduction, all lanes have the same (local_max, local_sum)
+
+  // --- Pass 2: Normalize in-place ---
+  float inv_sum = 1.0f / local_sum;
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = static_cast<float>(scores[i]) / sum_val;
+    scores[i] = static_cast<DataType>(expf(static_cast<float>(scores[i]) - local_max) * inv_sum);
   }
   __syncwarp();
 }
 
 /*******************************************************************************
- * naive_topk_and_mask_v1 — Warp-level bitonic-sort based top-K
+ * apply_softmax_on_float_with_writeback — Online softmax with fused write
+ * to a global memory destination array in the same normalize pass.
  *
- * Supports topk up to N_REGS * 32 (max 128 with N_REGS=4) by giving each of
- * the 32 warp lanes N_REGS register pairs (value, index).  The registers form
- * a virtual array of N_REGS*32 elements in row-major order:
+ * Identical to apply_softmax_on_float but also writes each softmax output to
+ * dest[dest_offset + i], saving a separate loop over the data.
+ ******************************************************************************/
+template <typename DataType>
+__device__ inline void apply_softmax_on_float_with_writeback(DataType *scores, int data_size,
+                                                              int lane_id, DataType *dest,
+                                                              int dest_offset) {
+  // --- Pass 1: Online accumulation of max and sum_exp ---
+  float local_max = -std::numeric_limits<float>::infinity();
+  float local_sum = 0.0f;
+
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    float val = static_cast<float>(scores[i]);
+    if (val > local_max) {
+      local_sum *= expf(local_max - val);
+      local_max = val;
+    }
+    local_sum += expf(val - local_max);
+  }
+
+  // Warp-level reduction of (max, sum_exp)
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float other_max = __shfl_xor_sync(0xffffffff, local_max, offset);
+    float other_sum = __shfl_xor_sync(0xffffffff, local_sum, offset);
+    float new_max = fmaxf(local_max, other_max);
+    local_sum = local_sum * expf(local_max - new_max) + other_sum * expf(other_max - new_max);
+    local_max = new_max;
+  }
+
+  // --- Pass 2: Normalize in-place + write to global dest ---
+  float inv_sum = 1.0f / local_sum;
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    DataType result =
+        static_cast<DataType>(expf(static_cast<float>(scores[i]) - local_max) * inv_sum);
+    scores[i] = result;
+    dest[dest_offset + i] = result;
+  }
+  __syncwarp();
+}
+
+/*******************************************************************************
+ * naive_topk_and_mask_v2 — Warp-level radix-selection based top-K
  *
- *   virtual_pos(reg_r, lane_l) = r * 32 + l
+ * O(E) algorithm independent of K, adapted from PyTorch's radix selection.
+ * Uses 4-bit radix (16 buckets) → 8 passes for float32.
  *
- * A full bitonic sort over this virtual array uses:
- *   - __shfl_xor_sync  for partner distances j < 32  (cross-lane, same reg)
- *   - local register CAS for distances j >= 32        (same lane, cross-reg)
+ * Algorithm:
+ *   Phase 1 — Radix selection (8 passes):
+ *     Convert float scores to "order-preserving" uint32 (flip sign bit for
+ *     positives, flip all bits for negatives).  Then iterate 4 bits at a time
+ *     from the MSB.  Each pass:
+ *       1. Each of 32 threads counts elements per radix bucket that match the
+ *          "desired" bit pattern found so far.
+ *       2. Warp-reduce the per-thread histograms (16 sums).
+ *       3. Scan buckets from largest to smallest to locate which bucket
+ *          contains the K-th largest element.
+ *       4. Narrow the desired pattern by 4 bits.
+ *     After 8 passes: the exact uint32 bit pattern of the K-th value is known.
  *
- * After sorting descending, virtual positions 0..topk-1 hold the result.
+ *   Phase 2 — Gather (single pass over E):
+ *     Collect elements strictly greater than the K-th value (same uint order),
+ *     then fill remaining slots with elements equal to the K-th value (ties
+ *     broken by ascending index for determinism matching torch.topk).
+ *     Write indices and scores to the output arrays.
  *
- * Streaming merge
- * ---------------
- * When data_size > N_REGS*32, we stream in chunks.  The first
- * keep_regs = ceil(topk/32) register rows are the "keep set" and are never
- * overwritten.  The remaining (N_REGS - keep_regs) rows accept new data each
- * chunk, are merged via a full sort, and the tail is discarded.
- *
- * Complexity: O( (E / new_slots) * N_REGS * 32 * log²(N_REGS*32) )
- *           ≈ O( E * log²(N_REGS*32) )  — no K² term.
- *
- * Stability: ties broken by original index ascending (lower index wins),
- *            matching the original naive_topk_and_mask behavior.
+ * Tie-breaking: (value DESC, index ASC) — matches torch.topk behavior.
  *
  * Constraints:
- *   - topk <= N_REGS * 32  (i.e. topk <= 128 for N_REGS=4)
- *   - If data_size > N_REGS*32, then topk < N_REGS*32 (need spare slots)
- *   - N_REGS must be a power of two: {1, 2, 4}.  Non-power-of-two values
- *     (e.g. 3) cause the bitonic sort's cross-register CAS steps to
- *     reference non-existent registers, silently skipping comparisons
- *     and breaking sort correctness.
+ *   - 0 < topk <= data_size
+ *   - No upper limit on topk or data_size (unlike v1's 128 cap)
+ *   - scores must be in shared memory accessible by the warp
+ *
+ * Complexity: 9 × O(E/32) = O(E) per warp, independent of K.
  ******************************************************************************/
 
-// Compare-and-swap helper for descending sort by (value DESC, index ASC).
-// "Descending" means: the element that should come first (lower virtual position)
-// has a higher value, or on tie, a lower original index.
-__device__ inline void bitonic_cas_descending(float &val_a, int &idx_a, float &val_b, int &idx_b) {
-  bool swap = (val_a < val_b) || (val_a == val_b && idx_a > idx_b);
-  if (swap) {
-    float tmp_val = val_a;
-    val_a = val_b;
-    val_b = tmp_val;
-    int tmp_idx = idx_a;
-    idx_a = idx_b;
-    idx_b = tmp_idx;
-  }
+// Convert float to an unsigned integer that preserves descending sort order.
+// After conversion, a numerically larger float maps to a larger uint32.
+// This allows bitwise radix selection to find top-K by searching from MSB.
+__device__ inline unsigned int float_to_ordered_uint(float f) {
+  unsigned int u = __float_as_uint(f);
+  // If sign bit is set (negative), flip all bits.
+  // If sign bit is clear (positive or +0), flip only the sign bit.
+  unsigned int mask = (u & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
+  return u ^ mask;
 }
 
-/*******************************************************************************
- * Warp-level bitonic sort over N_REGS * 32 elements (N_REGS in {1,2,3,4}).
- *
- * Each lane holds vals[0..N_REGS-1] and idxs[0..N_REGS-1].  The virtual
- * position of (reg r, lane l) is  r*32 + l.  After this function returns,
- * virtual position 0 holds the global maximum and position N_REGS*32-1 the
- * minimum.
- *
- * The total virtual size TOTAL = N_REGS * 32 need not be a power of two for
- * N_REGS = 3 (96 elements).  We round up to the next power of two (128) for
- * the bitonic network and pad with sentinels, but this is handled implicitly
- * by initializing unused registers to (-inf, -1) before entry.
- *
- * Implementation note: to keep the code compact and avoid per-N_REGS template
- * specializations for every CAS step, we use helper lambdas that map a
- * virtual position to (reg, lane) and vice-versa.
- ******************************************************************************/
-
-// Core bitonic sort over N registers × 32 lanes.
-// vals[0..N-1] and idxs[0..N-1] are the per-lane register arrays.
-// TOTAL_P2 is the padded power-of-2 total size (>= N*32).
-// Virtual positions >= N*32 are assumed to hold sentinels already.
-template <int N>
-__device__ inline void warp_bitonic_sort_N_descending(float (&vals)[N], int (&idxs)[N], int lane_id,
-                                                      int total_p2) {
-  // Bitonic sort: iterate over stages k = 2, 4, 8, ... total_p2
-  // and sub-stages j = k/2, k/4, ... 1.
-  // For each (k, j), every virtual position p is paired with p ^ j.
-  // The sort direction for position p within stage k:
-  //   descending if ((p & k) == 0), ascending otherwise.
-  for (int k = 2; k <= total_p2; k <<= 1) {
-    for (int j = k >> 1; j > 0; j >>= 1) {
-      // Determine which register pairs are involved.
-      // Partner of virtual pos (r, lane_id) = r*32 + lane_id is at
-      //   partner_pos = (r*32 + lane_id) ^ j
-      //   partner_reg = partner_pos / 32,  partner_lane = partner_pos % 32
-      // Two cases:
-      //   j < 32:  partner_reg == r (same reg), partner_lane = lane_id ^ j
-      //   j >= 32: partner_lane == lane_id (same lane), partner_reg = r ^ (j/32)
-
-      if (j < 32) {
-        // Cross-lane exchange within each register.
-        // Both lanes in a pair receive each other's value via the shuffle.
-        // Each lane independently decides whether to keep its own value or
-        // the partner's, based on whether it is the "low" or "high" position
-        // in the comparator and the sort direction for this sub-sequence.
-#pragma unroll
-        for (int r = 0; r < N; r++) {
-          int vpos = r * 32 + lane_id;
-          float partner_val = __shfl_xor_sync(0xffffffff, vals[r], j);
-          int partner_idx = __shfl_xor_sync(0xffffffff, idxs[r], j);
-
-          // Determine sort direction: descending if this position's
-          // k-th bit is 0, ascending otherwise.
-          bool descending = ((vpos & k) == 0);
-          // Am I the lower virtual position in this pair?
-          bool is_low = (lane_id & j) == 0;
-
-          // The low position keeps the "winner" (larger for descending,
-          // smaller for ascending); the high position keeps the other.
-          // Equivalently: low+descending → keep max; low+ascending → keep min;
-          //               high+descending → keep min; high+ascending → keep max.
-          // "want_larger" means this lane should hold the larger element.
-          bool want_larger = (is_low == descending);
-
-          // Check if we need to swap: does the partner have what we want?
-          bool partner_is_larger =
-              (partner_val > vals[r]) || (partner_val == vals[r] && partner_idx < idxs[r]);
-          if (want_larger == partner_is_larger) {
-            vals[r] = partner_val;
-            idxs[r] = partner_idx;
-          }
-        }
-      } else {
-        // Same-lane exchange across registers
-        int reg_dist = j / 32;  // distance in register indices
-#pragma unroll
-        for (int r = 0; r < N; r++) {
-          int partner_r = r ^ reg_dist;
-          if (partner_r > r && partner_r < N) {
-            int vpos = r * 32 + lane_id;
-            bool descending = ((vpos & k) == 0);
-            if (descending) {
-              bitonic_cas_descending(vals[r], idxs[r], vals[partner_r], idxs[partner_r]);
-            } else {
-              bitonic_cas_descending(vals[partner_r], idxs[partner_r], vals[r], idxs[r]);
-            }
-          }
-        }
-      }
-      __syncwarp();
-    }
-  }
+// Convert back from ordered uint to float.
+__device__ inline float ordered_uint_to_float(unsigned int u) {
+  // Reverse the transformation: if MSB is set (was positive), flip sign bit.
+  // If MSB is clear (was negative), flip all bits.
+  unsigned int mask = (u & 0x80000000u) ? 0x80000000u : 0xFFFFFFFFu;
+  return __uint_as_float(u ^ mask);
 }
 
-template <typename T, int N_REGS>
-__device__ inline void naive_topk_and_mask_v1_impl(T *scores, int data_size, int topk,
-                                                   int *topk_indices, T *topk_scores, int lane_id) {
-  constexpr float NEG_INF = std::numeric_limits<float>::lowest();
-  constexpr int INVALID_IDX = -1;
-  constexpr int TOTAL = N_REGS * 32;
-
-  // Padded power-of-2 total for bitonic network.
-  // N_REGS must be a power of two (1, 2, or 4) so TOTAL == TOTAL_P2.
-  // N_REGS: 1->32, 2->64, 4->128
-  constexpr int TOTAL_P2 = (N_REGS <= 1) ? 32 : (N_REGS <= 2) ? 64 : 128;
-
-  // ---- Precondition checks (device-side asserts) ----
-  // topk must fit within the N_REGS register slots
-  assert(topk > 0 && "naive_topk_and_mask_v1: topk must be positive");
-  assert(topk <= TOTAL && "naive_topk_and_mask_v1: topk exceeds N_REGS * 32 capacity");
-  assert(topk <= data_size && "naive_topk_and_mask_v1: topk exceeds data_size");
-  // Streaming requires at least 32 spare slots (one register row) for new data
-  assert((data_size <= TOTAL || topk <= (N_REGS - 1) * 32) &&
-         "naive_topk_and_mask_v1: data_size > N_REGS*32 but topk leaves no spare register "
-         "row for streaming; increase N_REGS or reduce topk");
-
-  // Register arrays: each lane holds N_REGS (value, index) pairs
-  float vals[N_REGS];
-  int idxs[N_REGS];
-
-  // Initialize all to sentinel
-#pragma unroll
-  for (int r = 0; r < N_REGS; r++) {
-    vals[r] = NEG_INF;
-    idxs[r] = INVALID_IDX;
-  }
-
-  // Number of register rows dedicated to the keep set
-  int keep_regs = (topk + 31) / 32;  // ceil(topk / 32)
-
-  // Number of new element slots per chunk (the non-keep rows)
-  int new_slots = (N_REGS - keep_regs) * 32;
-
-  if (data_size <= TOTAL) {
-    // ---- Fast path: everything fits in registers, single sort ----
-#pragma unroll
-    for (int r = 0; r < N_REGS; r++) {
-      int elem_idx = r * 32 + lane_id;
-      if (elem_idx < data_size) {
-        vals[r] = static_cast<float>(scores[elem_idx]);
-        idxs[r] = elem_idx;
-      }
-    }
-
-    // For N_REGS=3, positions 96..127 are virtual (TOTAL_P2=128)
-    // They stay as sentinel, which is correct (sorted to the bottom).
-    warp_bitonic_sort_N_descending<N_REGS>(vals, idxs, lane_id, TOTAL_P2);
-
-  } else {
-    // ---- Streaming path: merge chunks into the running top-K ----
-    // First chunk: fill all N_REGS rows
-#pragma unroll
-    for (int r = 0; r < N_REGS; r++) {
-      int elem_idx = r * 32 + lane_id;
-      if (elem_idx < data_size) {
-        vals[r] = static_cast<float>(scores[elem_idx]);
-        idxs[r] = elem_idx;
-      }
-    }
-    warp_bitonic_sort_N_descending<N_REGS>(vals, idxs, lane_id, TOTAL_P2);
-
-    // Discard tail (positions >= topk): reset non-keep slots to sentinel
-#pragma unroll
-    for (int r = keep_regs; r < N_REGS; r++) {
-      // For the boundary register row (r == keep_regs-1 is kept fully;
-      // r == keep_regs may be partially kept if topk is not a multiple of 32)
-      vals[r] = NEG_INF;
-      idxs[r] = INVALID_IDX;
-    }
-    // Handle partial keep in the last keep row
-    if (topk % 32 != 0 && keep_regs > 0) {
-      int last_keep = keep_regs - 1;
-      if (lane_id >= (topk % 32)) {
-        vals[last_keep] = NEG_INF;
-        idxs[last_keep] = INVALID_IDX;
-      }
-    }
-    __syncwarp();
-
-    // Subsequent chunks
-    for (int base = TOTAL; base < data_size; base += new_slots) {
-      // Load new data into the non-keep register rows
-#pragma unroll
-      for (int r = keep_regs; r < N_REGS; r++) {
-        int slot_in_new = (r - keep_regs) * 32 + lane_id;
-        int elem_idx = base + slot_in_new;
-        if (elem_idx < data_size) {
-          vals[r] = static_cast<float>(scores[elem_idx]);
-          idxs[r] = elem_idx;
-        } else {
-          vals[r] = NEG_INF;
-          idxs[r] = INVALID_IDX;
-        }
-      }
-
-      warp_bitonic_sort_N_descending<N_REGS>(vals, idxs, lane_id, TOTAL_P2);
-
-      // Discard tail again
-#pragma unroll
-      for (int r = keep_regs; r < N_REGS; r++) {
-        vals[r] = NEG_INF;
-        idxs[r] = INVALID_IDX;
-      }
-      if (topk % 32 != 0 && keep_regs > 0) {
-        int last_keep = keep_regs - 1;
-        if (lane_id >= (topk % 32)) {
-          vals[last_keep] = NEG_INF;
-          idxs[last_keep] = INVALID_IDX;
-        }
-      }
-      __syncwarp();
-    }
-  }
-
-  // Write results: virtual positions 0..topk-1 hold the top-K descending
-#pragma unroll
-  for (int r = 0; r < N_REGS; r++) {
-    int vpos = r * 32 + lane_id;
-    if (vpos < topk) {
-      topk_indices[vpos] = idxs[r];
-      topk_scores[vpos] = static_cast<T>(vals[r]);
-    }
-  }
-  __syncwarp();
-}
-
-// Dispatch wrapper: selects N_REGS based on topk AND data_size at runtime.
-//
-// N_REGS must satisfy two constraints:
-//   1. topk  <= N_REGS * 32        (results must fit in register file)
-//   2. If data_size > N_REGS * 32 (streaming path), we need at least one
-//      spare register row for incoming data, i.e.  keep_regs < N_REGS
-//      where keep_regs = ceil(topk / 32).  Equivalently:
-//        N_REGS >= ceil(topk / 32) + 1
-//
-// We compute min_n_regs satisfying both constraints, then round up to a
-// power of two.  The bitonic sort network operates over TOTAL_P2 virtual
-// positions (next power-of-two >= N_REGS*32).  When N_REGS is not a
-// power of two (e.g. N_REGS=3, TOTAL_P2=128), cross-register CAS steps
-// reference register indices that don't exist (e.g. register 3), causing
-// those comparisons to be silently skipped and breaking the bitonic
-// invariants.  Restricting N_REGS to {1, 2, 4} avoids the problem
-// entirely since N_REGS*32 is always a power of two.
-//
-// Supported N_REGS: 1, 2, 4.
-// Maximum topk:
-//   - If data_size <= 128:  topk <= 128  (no streaming, N_REGS=4 suffices)
-//   - If data_size >  128:  topk <=  96  (streaming, need spare row, N_REGS=4
-//                                          gives keep_regs<=3 < 4)
-//
-// Preconditions:
-//   - 0 < topk <= 128
-//   - 0 < topk <= data_size
 template <typename T>
-__device__ inline void naive_topk_and_mask_v1(T *scores, int data_size, int topk,
+__device__ inline void naive_topk_and_mask_v2(T *scores, int data_size, int topk,
                                               int *topk_indices, T *topk_scores, int lane_id) {
-  assert(topk > 0 && "naive_topk_and_mask_v1: topk must be positive");
-  assert(topk <= 128 && "naive_topk_and_mask_v1: topk exceeds maximum supported value (128)");
-  assert(data_size >= topk && "naive_topk_and_mask_v1: data_size must be >= topk");
+  // assert(topk > 0 && "naive_topk_and_mask_v2: topk must be positive");
+  // assert(topk <= data_size && "naive_topk_and_mask_v2: topk exceeds data_size");
 
-  // Minimum N_REGS to hold the topk results
-  int keep_regs = (topk + 31) / 32;  // ceil(topk / 32)
+  constexpr int RADIX_BITS = 4;
+  constexpr int RADIX_SIZE = 1 << RADIX_BITS;  // 16 buckets
+  constexpr int RADIX_MASK = RADIX_SIZE - 1;    // 0xF
+  constexpr int NUM_PASSES = 32 / RADIX_BITS;   // 8 passes for float32
 
-  // If streaming is needed, we need at least one extra register row
-  // for incoming data.  Compute the minimum total required.
+  // =========================================================================
+  // Phase 1: Radix selection — find the bit pattern of the K-th largest value
+  // =========================================================================
+  unsigned int desired = 0;      // accumulated bit pattern of the K-th value
+  unsigned int desired_mask = 0; // bits determined so far
+  int k_remaining = topk;        // how many more elements we need to skip
+
+  for (int pass = NUM_PASSES - 1; pass >= 0; pass--) {
+    int digit_pos = pass * RADIX_BITS;
+
+    // Each thread counts elements per bucket that match the desired pattern
+    unsigned int counts[RADIX_SIZE];
+#pragma unroll
+    for (int b = 0; b < RADIX_SIZE; b++) {
+      counts[b] = 0;
+    }
+
+    for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+      unsigned int u = float_to_ordered_uint(static_cast<float>(scores[i]));
+      // Check if this element matches the desired pattern on already-decided bits
+      if ((u & desired_mask) == desired) {
+        int bucket = (u >> digit_pos) & RADIX_MASK;
+        counts[bucket]++;
+      }
+    }
+
+    // Warp-reduce each bucket count across all 32 lanes
+    unsigned int total_counts[RADIX_SIZE];
+#pragma unroll
+    for (int b = 0; b < RADIX_SIZE; b++) {
+      unsigned int c = counts[b];
+      // Butterfly reduction
+      c += __shfl_xor_sync(0xffffffff, c, 16);
+      c += __shfl_xor_sync(0xffffffff, c, 8);
+      c += __shfl_xor_sync(0xffffffff, c, 4);
+      c += __shfl_xor_sync(0xffffffff, c, 2);
+      c += __shfl_xor_sync(0xffffffff, c, 1);
+      total_counts[b] = c;  // same value on all lanes after full reduction
+    }
+
+    // Scan buckets from LARGEST digit value (15) to smallest (0).
+    // We're looking for the top-K largest, so we want the highest-valued
+    // bucket first.  Accumulate counts until we find the bucket containing
+    // the k_remaining-th element.
+    int target_bucket = 0;
+    for (int b = RADIX_SIZE - 1; b >= 0; b--) {
+      unsigned int bc = total_counts[b];
+      if (bc < static_cast<unsigned int>(k_remaining)) {
+        // All elements in this bucket are in the top set; skip them
+        k_remaining -= bc;
+      } else {
+        // The K-th element is in this bucket
+        target_bucket = b;
+        break;
+      }
+    }
+
+    // Update the desired pattern and mask
+    desired |= (static_cast<unsigned int>(target_bucket) << digit_pos);
+    desired_mask |= (static_cast<unsigned int>(RADIX_MASK) << digit_pos);
+  }
+
+  // After all passes, `desired` holds the exact ordered-uint bit pattern of
+  // the K-th largest value, and `k_remaining` is the number of elements with
+  // that exact value that should be included in the top-K set.
+  // (k_remaining >= 1 unless all elements equal the K-th value boundary)
+
+  // =========================================================================
+  // Phase 2: Gather — collect top-K elements into output arrays
+  // =========================================================================
+  // Two sub-passes over the data:
+  //   Pass A: Collect all elements strictly greater than the K-th value.
+  //   Pass B: Collect elements equal to the K-th value (up to k_remaining),
+  //           in ascending index order for deterministic tie-breaking.
   //
-  // min_n_regs = keep_regs           if data_size <= keep_regs * 32
-  //            = keep_regs + 1       otherwise (need streaming)
-  bool needs_streaming_at_min = (data_size > keep_regs * 32);
-  int min_n_regs = needs_streaming_at_min ? keep_regs + 1 : keep_regs;
+  // Since the warp processes indices in strided order, we need a warp-level
+  // prefix sum to assign output positions without conflicts.
 
-  // Round up to the next power of two to ensure the bitonic sort network
-  // has no missing register partners in cross-register CAS steps.
-  // 1 → 1, 2 → 2, 3 → 4, 4 → 4
-  if (min_n_regs == 3) {
-    min_n_regs = 4;
+  // --- Pass A: elements strictly greater than K-th value ---
+  // Use a warp-wide running counter for output position.
+  int write_pos = 0;  // shared across warp via __shfl_sync
+
+  for (int base = 0; base < data_size; base += kThreadsPerWarp) {
+    int i = base + lane_id;
+    bool valid = (i < data_size);
+
+    unsigned int u = valid ? float_to_ordered_uint(static_cast<float>(scores[i])) : 0;
+    bool is_greater = valid && (u > desired);
+
+    // Warp ballot to count how many lanes have a qualifying element
+    unsigned int ballot = __ballot_sync(0xffffffff, is_greater);
+    int lane_prefix = __popc(ballot & ((1u << lane_id) - 1));  // exclusive prefix
+    int total_qualifying = __popc(ballot);
+
+    if (is_greater) {
+      int out_idx = write_pos + lane_prefix;
+      if (out_idx < topk) {
+        topk_indices[out_idx] = i;
+        topk_scores[out_idx] = scores[i];
+      }
+    }
+    write_pos += total_qualifying;
   }
 
-  assert(min_n_regs <= 4 &&
-         "naive_topk_and_mask_v1: topk/data_size combination requires N_REGS > 4 "
-         "(topk too large for streaming with 4 register rows)");
+  // --- Pass B: elements equal to K-th value (up to k_remaining) ---
+  int tie_remaining = k_remaining;  // broadcast same value to all lanes
 
-  if (min_n_regs <= 1) {
-    naive_topk_and_mask_v1_impl<T, 1>(scores, data_size, topk, topk_indices, topk_scores, lane_id);
-  } else if (min_n_regs <= 2) {
-    naive_topk_and_mask_v1_impl<T, 2>(scores, data_size, topk, topk_indices, topk_scores, lane_id);
-  } else {
-    naive_topk_and_mask_v1_impl<T, 4>(scores, data_size, topk, topk_indices, topk_scores, lane_id);
+  for (int base = 0; base < data_size && tie_remaining > 0; base += kThreadsPerWarp) {
+    int i = base + lane_id;
+    bool valid = (i < data_size);
+
+    unsigned int u = valid ? float_to_ordered_uint(static_cast<float>(scores[i])) : 0;
+    bool is_equal = valid && (u == desired);
+
+    unsigned int ballot = __ballot_sync(0xffffffff, is_equal);
+    int lane_prefix = __popc(ballot & ((1u << lane_id) - 1));
+    int total_equal = __popc(ballot);
+
+    if (is_equal && lane_prefix < tie_remaining) {
+      int out_idx = write_pos + lane_prefix;
+      if (out_idx < topk) {
+        topk_indices[out_idx] = i;
+        topk_scores[out_idx] = scores[i];
+      }
+    }
+
+    int consumed = (total_equal < tie_remaining) ? total_equal : tie_remaining;
+    write_pos += consumed;
+    tie_remaining -= consumed;
   }
+
+  __syncwarp();
 }
 
 template <typename T>

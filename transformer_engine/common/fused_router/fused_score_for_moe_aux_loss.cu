@@ -121,7 +121,7 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
          * Section: Topk
          * Get the topk indices
          */
-    naive_topk_and_mask(local_logits, num_experts, topk, topk_indices, topk_logits, lane_id);
+    naive_topk_and_mask_v2(local_logits, num_experts, topk, topk_indices, topk_logits, lane_id);
     __syncwarp();
 
     // Write the routing_map to the output tensor

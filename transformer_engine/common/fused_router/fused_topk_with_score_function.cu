@@ -146,7 +146,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       int group_size = num_experts / num_groups;
       // Top2
       for (int i = 0; i < num_groups; i++) {
-        naive_topk_and_mask(
+        naive_topk_and_mask_v2(
             /*scores ptr = */ scores + i * group_size,
             /*data size = */ group_size,
             /*topk = */ topk / group_topk,
@@ -166,7 +166,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       }
 
       // select the topk groups
-      naive_topk_and_mask(
+      naive_topk_and_mask_v2(
           /*scores ptr = */ group_scores,
           /*data size = */ num_groups,
           /*topk = */ group_topk,
@@ -183,10 +183,10 @@ __global__ void fused_topk_with_score_function_forward_kernel(
         }
       }
       __syncwarp();
-      naive_topk_and_mask_v1(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      naive_topk_and_mask_v2(masked_scores, num_experts, topk, topk_indices, topk_scores, lane_id);
 
     } else {
-      naive_topk_and_mask_v1(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
+      naive_topk_and_mask_v2(scores, num_experts, topk, topk_indices, topk_scores, lane_id);
     }
     __syncwarp();
 

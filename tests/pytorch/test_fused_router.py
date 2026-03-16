@@ -254,8 +254,8 @@ def test_topk_sigmoid(
 
 @pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("num_tokens", [2048, 7168, 14234])
-@pytest.mark.parametrize("num_experts", [128, 32])
-@pytest.mark.parametrize("topk", [4, 8])
+@pytest.mark.parametrize("num_experts", [512, 128, 32])
+@pytest.mark.parametrize("topk", [8, 32, 64])
 @pytest.mark.parametrize("use_pre_softmax", [True, False])
 @pytest.mark.parametrize("group_topk", [None, 4])
 @pytest.mark.parametrize("scaling_factor", [None, 1.2])

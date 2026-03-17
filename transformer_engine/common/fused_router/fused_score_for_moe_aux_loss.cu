@@ -69,7 +69,6 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       local_logits[i] = static_cast<CompType>(logits[pos_offset + i]);
     }
-    __threadfence_block();
     __syncwarp();
 
     /***
@@ -136,7 +135,6 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       scores[pos_offset + i] = local_logits[i];
     }
-    __threadfence_block();
     __syncwarp();
   }
 }
@@ -224,7 +222,6 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *int
       local_grad[i] = grad_scores[pos_offset + i];
       local_act_from_fwd[i] = intermediate_output[pos_offset + i];
     }
-    __threadfence_block();
     __syncwarp();
 
     /***

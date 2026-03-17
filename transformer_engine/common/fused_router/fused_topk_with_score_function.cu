@@ -72,9 +72,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       probs[pos_offset + i] = 0.0;
       routing_map[pos_offset + i] = false;
-      if (score_function == 1) {
-        intermediate_output[pos_offset + i] = -std::numeric_limits<CompType>::infinity();
-      }
+      // intermediate_output global store not needed as we always store that
     }
     // Load the logits to shmem
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
@@ -86,7 +84,6 @@ __global__ void fused_topk_with_score_function_forward_kernel(
         masked_scores[i] = -std::numeric_limits<CompType>::infinity();
       }
     }
-    __threadfence_block();
     __syncwarp();
 
     /***
@@ -234,7 +231,6 @@ __global__ void fused_topk_with_score_function_forward_kernel(
       routing_map[pos_offset + topk_indices[i]] = true;
       probs[pos_offset + topk_indices[i]] = scaling_factor * topk_scores[i];
     }
-    __threadfence_block();
     __syncwarp();
   }
 }
@@ -352,7 +348,6 @@ __global__ void fused_topk_with_score_function_backward_kernel(
       local_act_from_fwd[i] = intermediate_output[pos_offset + i];
       local_routing_map[i] = routing_map[pos_offset + i];
     }
-    __threadfence_block();
     __syncwarp();
 
     /***

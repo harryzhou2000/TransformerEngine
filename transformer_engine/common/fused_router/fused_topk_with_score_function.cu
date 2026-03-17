@@ -6,12 +6,10 @@
 
 #include <assert.h>
 #include <cuda_runtime.h>
-#include <sstream>
 #include <transformer_engine/fused_router.h>
 
 #include "../common.h"
 #include "../util/logging.h"
-#include "../utils.cuh"
 #include "utils.h"
 
 namespace transformer_engine {
@@ -97,7 +95,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
          */
     if (use_pre_softmax && score_function == 1) {  // score_function == 1 means softmax
       // Apply softmax to the logits before the topk
-      apply_softmax_on_float(scores, num_experts, lane_id);
+      apply_softmax_on_float_v1(scores, num_experts, lane_id);
       __syncwarp();
       // Save the softmax output for backward
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
@@ -207,7 +205,7 @@ __global__ void fused_topk_with_score_function_forward_kernel(
     // score_function == 1 means softmax
     if (!use_pre_softmax && score_function == 1) {
       // Apply softmax to the topk logits
-      apply_softmax_on_float(topk_scores, topk, lane_id);
+      apply_softmax_on_float_v1(topk_scores, topk, lane_id);
       __syncwarp();
       // Save the softmax output for backward
       for (int i = lane_id; i < topk; i += kThreadsPerWarp) {
@@ -250,17 +248,6 @@ void fused_topk_with_score_function_forward_kernel_launcher(
     shared_memory_size += num_groups * num_token_per_block * sizeof(CompType);   // group_scores
     shared_memory_size += num_experts * num_token_per_block * sizeof(CompType);  // maksed_scores
   }
-
-  // {
-  //   std::stringstream oss;
-  //   oss << "[fused_topk_fwd] " << "num_tokens=" << num_tokens << ", num_experts=" << num_experts
-  //       << ", topk=" << topk << ", use_pre_softmax=" << use_pre_softmax
-  //       << ", num_groups=" << num_groups << ", group_topk=" << group_topk
-  //       << ", scaling_factor=" << scaling_factor << ", score_function=" << score_function
-  //       << ", grid_size=" << grid_size << ", num_token_per_block=" << num_token_per_block
-  //       << ", shared_memory_size=" << shared_memory_size << " bytes";
-  //   NVTE_WARN(oss.str());
-  // }
 
   cudaFuncSetAttribute(fused_topk_with_score_function_forward_kernel<DataType, BiasType>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, shared_memory_size);
@@ -338,10 +325,6 @@ __global__ void fused_topk_with_score_function_backward_kernel(
          * - Load the dgrad/output_from_fwd to shmem
          */
     int pos_offset = token_offset_cur_warp * num_experts;
-    // Clear the logits_grad in global mem
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      grad_logits[pos_offset + i] = 0.0f;
-    }
     // Load the dgrad/output_from_fwd to shmem
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       local_grad[i] = grad_probs[pos_offset + i];

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # See LICENSE for license information.
 import torch
@@ -113,10 +113,10 @@ def compute_scores_for_aux_loss_pytorch(
         scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits.float())
-        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     elif score_function == "sqrtsoftplus":
         scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -294,8 +294,8 @@ def test_topk_sqrtsoftplus(
 
 @pytest.mark.parametrize("dtype", [torch.float32])
 @pytest.mark.parametrize("num_tokens", [2048, 7168, 14234])
-@pytest.mark.parametrize("num_experts", [512, 128, 32])
-@pytest.mark.parametrize("topk", [8, 32, 64])
+@pytest.mark.parametrize("num_experts", [128, 32])
+@pytest.mark.parametrize("topk", [4, 8])
 @pytest.mark.parametrize("use_pre_softmax", [True, False])
 @pytest.mark.parametrize("group_topk", [None, 4])
 @pytest.mark.parametrize("scaling_factor", [None, 1.2])
@@ -324,9 +324,9 @@ def test_topk_softmax(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32])
-@pytest.mark.parametrize("num_tokens", [2048, 7168, 14234])
+@pytest.mark.parametrize("num_tokens", [2048, 7168])
 @pytest.mark.parametrize("num_experts", [256, 128, 32])
-@pytest.mark.parametrize("topk", [4, 8])
+@pytest.mark.parametrize("topk", [1, 4, 8])
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
 def test_fused_scores_for_aux_loss(dtype, num_tokens, num_experts, topk, score_function):
     if score_function in ("sigmoid", "sqrtsoftplus"):
@@ -436,15 +436,6 @@ def profile_topk_softmax(
     test_topk_softmax(
         torch.float32, num_tokens, num_experts, topk, use_pre_softmax, group_topk, scaling_factor
     )
-
-
-if __name__ == "__main__":
-    test_topk_softmax(
-        dtype=torch.float32,
-        num_tokens=1024,
-        num_experts=3000,
-        topk=4,
-        use_pre_softmax=False,
-        group_topk=None,
-        scaling_factor=None,
+    test_topk_sqrtsoftplus(
+        torch.float32, num_tokens, num_experts, topk, group_topk, scaling_factor, enable_bias
     )

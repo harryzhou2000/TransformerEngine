@@ -82,7 +82,7 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
          */
     if (score_function == 1) {  // score_function == 1 means softmax
       // Apply softmax to the logits before the topk
-      apply_softmax_on_float(local_logits, num_experts, lane_id);
+      apply_softmax_on_float_v1(local_logits, num_experts, lane_id);
       __syncwarp();
       // Save the softmax output for backward
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
@@ -108,14 +108,12 @@ __global__ void fused_score_for_moe_aux_loss_forward_kernel(const DataType *logi
 
     __syncwarp();  //Confirm the scores is written to the output
 
-    // Sigmoid/Sqrtsoftplus post-processing when topk > 1
+    // Sigmoid/Sqrtsoftplus post-processing
     if (score_function == 0 || score_function == 2) {
-      if (topk > 1) {
-        auto sum_logits =
-            warp_reduce_on_shmem(local_logits, num_experts, ReduceFuncType::SUM, lane_id);
-        for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-          local_logits[i] /= (sum_logits + epsilon);
-        }
+      auto sum_logits =
+          warp_reduce_on_shmem(local_logits, num_experts, ReduceFuncType::SUM, lane_id);
+      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+        local_logits[i] /= (sum_logits + epsilon);
       }
       __syncwarp();
     }
@@ -213,10 +211,6 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *int
          * - Load the dgrad/output_from_fwd to shmem
          */
     int pos_offset = token_offset_cur_warp * num_experts;
-    // Clear the logits_grad in global mem
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      grad_logits[pos_offset + i] = 0.0f;
-    }
     // Load the dgrad/output_from_fwd to shmem
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       local_grad[i] = grad_scores[pos_offset + i];
@@ -245,8 +239,8 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *int
       __syncwarp();
     }
 
-    // Sigmoid/Sqrtsoftplus Post-processing bwd when topk > 1 (normalization backward)
-    if (topk > 1 && (score_function == 0 || score_function == 2)) {
+    // Sigmoid/Sqrtsoftplus Post-processing bwd (normalization backward)
+    if (score_function == 0 || score_function == 2) {
       // Select the correct activation output buffer:
       // - Sigmoid: local_act_from_fwd already contains sigmoid output
       // - Sqrtsoftplus: local_comp_buf contains sqrtsoftplus output computed above

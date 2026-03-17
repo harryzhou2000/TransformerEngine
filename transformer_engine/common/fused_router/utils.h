@@ -189,7 +189,27 @@ __device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output
   }
 }
 
-__device__ inline void apply_softmax_on_float(float *scores, int data_size, int lane_id) {
+template <typename DataType>
+__device__ inline void apply_softmax_on_float(DataType *scores, int data_size, int lane_id) {
+  // 1. compute the max of value
+  float max_val =
+      static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::MAX, lane_id));
+  // 2. value -> exp_value
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    scores[i] = static_cast<float>(exp(static_cast<float>(scores[i]) - max_val));
+  }
+  __syncwarp();
+  // 3. compute the sum of exp_value
+  float sum_val =
+      static_cast<float>(warp_reduce_on_shmem(scores, data_size, ReduceFuncType::SUM, lane_id));
+  // 4. update the softmax value
+  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
+    scores[i] = static_cast<float>(scores[i]) / sum_val;
+  }
+  __syncwarp();
+}
+
+__device__ inline void apply_softmax_on_float_v1(float *scores, int data_size, int lane_id) {
   // --- Pass 1: Online accumulation of max and sum_exp ---
   float local_max = -std::numeric_limits<float>::infinity();
   float local_sum = 0.0f;
@@ -208,12 +228,25 @@ __device__ inline void apply_softmax_on_float(float *scores, int data_size, int 
   // When merging two lanes with (max_a, sum_a) and (max_b, sum_b):
   //   merged_max = max(max_a, max_b)
   //   merged_sum = sum_a * exp(max_a - merged_max) + sum_b * exp(max_b - merged_max)
+  //
+  // NaN guard: when data_size < 32, some lanes have (max=-inf, sum=0).
+  // Merging two such lanes computes expf(-inf - (-inf)) = expf(NaN) = NaN,
+  // and 0.0 * NaN = NaN in IEEE 754, contaminating valid lanes.
+  // Fix: treat -inf max as "no data" and skip the expf computation.
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
     float other_max = __shfl_xor_sync(0xffffffff, local_max, offset);
     float other_sum = __shfl_xor_sync(0xffffffff, local_sum, offset);
     float new_max = fmaxf(local_max, other_max);
-    local_sum = local_sum * expf(local_max - new_max) + other_sum * expf(other_max - new_max);
+    if (new_max > -std::numeric_limits<float>::infinity()) {
+      // At least one side has real data; safe to compute expf differences
+      float my_scale =
+          (local_max > -std::numeric_limits<float>::infinity()) ? expf(local_max - new_max) : 0.0f;
+      float other_scale =
+          (other_max > -std::numeric_limits<float>::infinity()) ? expf(other_max - new_max) : 0.0f;
+      local_sum = local_sum * my_scale + other_sum * other_scale;
+    }
+    // else: both sides are -inf (no data), keep local_sum = 0
     local_max = new_max;
   }
   // After reduction, all lanes have the same (local_max, local_sum)

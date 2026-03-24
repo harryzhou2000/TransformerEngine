@@ -40,6 +40,10 @@ from ..distributed import (
 from ..cpp_extensions import (
     general_grouped_gemm,
 )
+from ..cpp_extensions.device_init_grouped_gemm import (
+    device_init_grouped_gemm,
+    get_device_init_grouped_gemm_workspace,
+)
 from ..constants import GemmParallelModes, dist_group_type
 from ..jit import no_torch_dynamo
 from ..cpu_offload import is_cpu_offload_enabled, mark_not_offload, start_offload
@@ -98,7 +102,16 @@ class _GroupedLinear(torch.autograd.Function):
             debug,
         ) = non_tensor_args
 
-        num_gemms = len(m_splits)
+        # Detect device-initiated mode: m_splits is a CUDA tensor
+        m_splits_on_device = isinstance(m_splits, torch.Tensor) and m_splits.is_cuda
+        if m_splits_on_device:
+            num_gemms = m_splits.size(0)
+            assert not use_bias, (
+                "Bias is not supported for device-initiated grouped GEMM "
+                "(m_splits on device)."
+            )
+        else:
+            num_gemms = len(m_splits)
         weights = weights_and_biases[:num_gemms]
         biases = weights_and_biases[num_gemms:]
         device = inp.device
@@ -144,7 +157,13 @@ class _GroupedLinear(torch.autograd.Function):
             )
         inp_view = inp.reshape(-1, in_features)
         inputmats: list
-        if fp8 and not debug:
+        if m_splits_on_device:
+            # Cannot split because m_splits is not available on host.
+            assert fp8 and FP8GlobalStateManager.get_fp8_recipe().mxfp8(), (
+                "Only MXFP8 is supported when m_splits is on device"
+            )
+            inputmats = [input_quantizers[0](inp_view)]
+        elif fp8 and not debug:
             # Disable bulk allocation when CPU offloading is active: offloading skips small
             # tensors (like scales), but bulk allocation shares storage across all tensors,
             # so if scales can't be offloaded, nothing in the group can be offloaded.
@@ -190,11 +209,18 @@ class _GroupedLinear(torch.autograd.Function):
             bias_dtype = torch.bfloat16  # FP8 GEMM only supports BF16/FP16 bias
         biases = [cast_if_needed(bias, bias_dtype) for bias in biases] if use_bias else biases
         # Initialize output tensor
-        out = torch.empty(
-            [sum(m_splits), weights_fp8[0].size(0)],
-            dtype=activation_dtype,
-            device=device,
-        )
+        if m_splits_on_device:
+            out = torch.empty(
+                [inputmats[0].size(0), weights_fp8[0].size(0)],
+                dtype=activation_dtype,
+                device=device,
+            )
+        else:
+            out = torch.empty(
+                [sum(m_splits), weights_fp8[0].size(0)],
+                dtype=activation_dtype,
+                device=device,
+            )
 
         # Choose whether to use split accumulator
         use_split_accumulator = _2X_ACC_FPROP
@@ -204,18 +230,31 @@ class _GroupedLinear(torch.autograd.Function):
                 use_split_accumulator = recipe.fp8_gemm_fprop.use_split_accumulator
 
         # Perform GEMM
-        general_grouped_gemm(
-            weights_fp8,
-            inputmats,
-            [out],
-            output_quantizers,
-            activation_dtype,
-            single_output=True,
-            m_splits=m_splits,
-            bias=biases,
-            use_bias=use_bias,
-            use_split_accumulator=use_split_accumulator,
-        )
+        if m_splits_on_device:
+            device_init_grouped_gemm(
+                weights_fp8,
+                inputmats,
+                [out],
+                activation_dtype,
+                get_device_init_grouped_gemm_workspace(),
+                layout="TN",
+                m_splits=m_splits,
+                single_output=True,
+                use_split_accumulator=use_split_accumulator,
+            )
+        else:
+            general_grouped_gemm(
+                weights_fp8,
+                inputmats,
+                [out],
+                output_quantizers,
+                activation_dtype,
+                single_output=True,
+                m_splits=m_splits,
+                bias=biases,
+                use_bias=use_bias,
+                use_split_accumulator=use_split_accumulator,
+            )
 
         if fp8_calibration:
             for i in range(num_gemms):
@@ -235,7 +274,7 @@ class _GroupedLinear(torch.autograd.Function):
             # TODO: update after #1638 is merged. # pylint: disable=fixme
             if weight_requires_grad:
                 if save_original_input:
-                    inputmats = [None] * num_gemms
+                    inputmats = [None] * num_gemms if not m_splits_on_device else [None]
                     inputmats[0] = inp
                 else:
                     for inputmat in inputmats:
@@ -287,6 +326,7 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.device = device
             ctx.output_quantizers = output_quantizers
             ctx.m_splits = m_splits
+            ctx.m_splits_on_device = m_splits_on_device
             ctx.num_gemms = num_gemms
             ctx.activation_dtype = activation_dtype
             ctx.fp8 = fp8
@@ -318,10 +358,16 @@ class _GroupedLinear(torch.autograd.Function):
         with get_nvtx_range_context("_GroupedLinear_backward"):
             saved_tensors = restore_from_func_ctx(ctx)
             N = ctx.num_gemms
-            inputmats = saved_tensors[:N]
-            weights = saved_tensors[N : 2 * N]
-            origin_weights = saved_tensors[2 * N : 3 * N]
-            biases = saved_tensors[3 * N : 4 * N]
+            if ctx.m_splits_on_device:
+                inputmats = saved_tensors[:1]
+                weights = saved_tensors[1 : 1 + N]
+                origin_weights = saved_tensors[1 + N : 1 + 2 * N]
+                biases = saved_tensors[1 + 2 * N : 1 + 3 * N]
+            else:
+                inputmats = saved_tensors[:N]
+                weights = saved_tensors[N : 2 * N]
+                origin_weights = saved_tensors[2 * N : 3 * N]
+                biases = saved_tensors[3 * N : 4 * N]
             main_grads = [main_grad_func() for main_grad_func in ctx.main_grad_funcs]
 
             if ctx.cpu_offloading:
@@ -338,7 +384,14 @@ class _GroupedLinear(torch.autograd.Function):
             grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
             grad_output = [None] * ctx.num_gemms
             grad_biases = [None] * ctx.num_gemms
-            if ctx.fp8 and not ctx.debug:
+            if ctx.m_splits_on_device:
+                # Device-initiated path: quantize as a single chunk
+                assert ctx.fp8 and ctx.fp8_recipe.mxfp8(), (
+                    "Only MXFP8 is supported when m_splits is on device"
+                )
+                assert not ctx.use_bias, "Bias is not supported when m_splits is on device"
+                grad_output = [ctx.grad_output_quantizers[0](grad_output_view)]
+            elif ctx.fp8 and not ctx.debug:
                 if ctx.use_bias:
                     grad_output_mats = torch.split(grad_output_view, ctx.m_splits)
                     recipe = ctx.fp8_recipe
@@ -398,28 +451,49 @@ class _GroupedLinear(torch.autograd.Function):
                         dgrad_gemm_use_split_accumulator = (
                             recipe.fp8_gemm_dgrad.use_split_accumulator
                         )
-                dgrad = torch.empty(
-                    (sum(ctx.m_splits), ctx.weights_shape_1),
-                    dtype=ctx.activation_dtype,
-                    device=ctx.device,
-                )
+                if ctx.m_splits_on_device:
+                    dgrad = torch.empty(
+                        (inputmats[0].size(0), ctx.weights_shape_1),
+                        dtype=ctx.activation_dtype,
+                        device=ctx.device,
+                    )
+                else:
+                    dgrad = torch.empty(
+                        (sum(ctx.m_splits), ctx.weights_shape_1),
+                        dtype=ctx.activation_dtype,
+                        device=ctx.device,
+                    )
                 # Make sure weights are available in column-wise format
                 # for dgrad computation.
                 for weight in weights:
                     if isinstance(weight, QuantizedTensorStorage):
                         weight.update_usage(columnwise_usage=True)
-                general_grouped_gemm(
-                    weights,
-                    grad_output,
-                    [dgrad],
-                    ctx.grad_input_quantizers,
-                    ctx.activation_dtype,
-                    single_output=True,
-                    layout="NN",
-                    m_splits=ctx.m_splits,
-                    grad=True,
-                    use_split_accumulator=dgrad_gemm_use_split_accumulator,
-                )
+                if ctx.m_splits_on_device:
+                    device_init_grouped_gemm(
+                        weights,
+                        grad_output,
+                        [dgrad],
+                        ctx.activation_dtype,
+                        get_device_init_grouped_gemm_workspace(),
+                        layout="NN",
+                        m_splits=ctx.m_splits,
+                        single_output=True,
+                        grad=True,
+                        use_split_accumulator=dgrad_gemm_use_split_accumulator,
+                    )
+                else:
+                    general_grouped_gemm(
+                        weights,
+                        grad_output,
+                        [dgrad],
+                        ctx.grad_input_quantizers,
+                        ctx.activation_dtype,
+                        single_output=True,
+                        layout="NN",
+                        m_splits=ctx.m_splits,
+                        grad=True,
+                        use_split_accumulator=dgrad_gemm_use_split_accumulator,
+                    )
 
             if ctx.weights_requires_grad:
                 wgrad_gemm_use_split_accumulator = _2X_ACC_WGRAD
@@ -451,7 +525,12 @@ class _GroupedLinear(torch.autograd.Function):
                             else:
                                 input_quantizer.set_usage(rowwise=False, columnwise=True)
                     inputmats: list
-                    if ctx.fp8 and not ctx.debug:
+                    if ctx.m_splits_on_device:
+                        assert ctx.fp8 and ctx.fp8_recipe.mxfp8(), (
+                            "Only MXFP8 is supported when m_splits is on device"
+                        )
+                        inputmats = [ctx.input_quantizers[0](inp_view)]
+                    elif ctx.fp8 and not ctx.debug:
                         inputmats = tex.split_quantize(inp_view, ctx.m_splits, ctx.input_quantizers)
                     elif ctx.debug:
                         inputmats = DebugQuantizer.multi_tensor_quantize(
@@ -464,22 +543,38 @@ class _GroupedLinear(torch.autograd.Function):
                         inputmats = torch.split(
                             cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits
                         )
-                grouped_gemm_wgrad = functools.partial(
-                    general_grouped_gemm,
-                    quantization_params=ctx.grad_weight_quantizers,
-                    out_dtype=ctx.activation_dtype,
-                    layout="NT",
-                    grad=True,
-                    m_splits=ctx.m_splits,
-                    use_bias=ctx.use_bias if grad_biases[0] is None else None,
-                    bias=biases,
-                    use_split_accumulator=wgrad_gemm_use_split_accumulator,
-                    accumulate=(
-                        accumulate_wgrad_into_param_main_grad
-                        if not getattr(weights[0], "overwrite_main_grad", False)
-                        else False
-                    ),
-                )
+                if ctx.m_splits_on_device:
+                    grouped_gemm_wgrad = functools.partial(
+                        device_init_grouped_gemm,
+                        out_dtype=ctx.activation_dtype,
+                        workspaces=get_device_init_grouped_gemm_workspace(),
+                        layout="NT",
+                        m_splits=ctx.m_splits,
+                        wgrad=True,
+                        use_split_accumulator=wgrad_gemm_use_split_accumulator,
+                        accumulate=(
+                            accumulate_wgrad_into_param_main_grad
+                            if not getattr(weights[0], "overwrite_main_grad", False)
+                            else False
+                        ),
+                    )
+                else:
+                    grouped_gemm_wgrad = functools.partial(
+                        general_grouped_gemm,
+                        quantization_params=ctx.grad_weight_quantizers,
+                        out_dtype=ctx.activation_dtype,
+                        layout="NT",
+                        grad=True,
+                        m_splits=ctx.m_splits,
+                        use_bias=ctx.use_bias if grad_biases[0] is None else None,
+                        bias=biases,
+                        use_split_accumulator=wgrad_gemm_use_split_accumulator,
+                        accumulate=(
+                            accumulate_wgrad_into_param_main_grad
+                            if not getattr(weights[0], "overwrite_main_grad", False)
+                            else False
+                        ),
+                    )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                     ctx.wgrad_store.put([inputmats, grad_output, wgrad_list], grouped_gemm_wgrad)
@@ -921,7 +1016,7 @@ class GroupedLinear(TransformerEngineBaseModule):
     def forward(
         self,
         inp: torch.Tensor,
-        m_splits: List[int],
+        m_splits: Union[List[int], torch.Tensor],
         is_first_microbatch: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         """
@@ -931,8 +1026,11 @@ class GroupedLinear(TransformerEngineBaseModule):
         ----------
         inp : torch.Tensor
              Input tensor.
-        m_splits : List[int]
-                 List of integers representing the split of the input tensor.
+        m_splits : Union[List[int], torch.Tensor]
+                 List of integers or a CUDA int64 tensor representing the
+                 per-expert token counts. When a CUDA tensor is provided,
+                 the device-initiated CUTLASS grouped GEMM path is used
+                 (requires MXFP8 recipe, avoids host-device sync).
         is_first_microbatch : {True, False, None}, default = None
                              During training using either gradient accumulation or
                              pipeline parallelism a minibatch of data is further split
@@ -951,9 +1049,10 @@ class GroupedLinear(TransformerEngineBaseModule):
 
         if isinstance(inp, QuantizedTensorStorage):
             raise TypeError("GroupedLinear doesn't support input tensor in FP8.")
-        if len(m_splits) != self.num_gemms:
+        m_splits_len = m_splits.size(0) if isinstance(m_splits, torch.Tensor) else len(m_splits)
+        if m_splits_len != self.num_gemms:
             raise ValueError(
-                f"Number of splits ({len(m_splits)}) should match number of"
+                f"Number of splits ({m_splits_len}) should match number of"
                 f" GEMMs ({self.num_gemms})."
             )
 

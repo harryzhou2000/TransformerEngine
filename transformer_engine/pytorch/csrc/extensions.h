@@ -168,6 +168,14 @@ py::object te_general_grouped_gemm_for_discrete_out(py::handle A, bool transa, p
                                                     at::Tensor workspace_cublas,
                                                     bool use_split_accumulator, int math_sm_count);
 
+std::optional<std::vector<at::Tensor>> te_general_device_init_grouped_gemm(
+    std::vector<py::handle> A, bool transa, std::vector<py::handle> B, bool transb,
+    std::optional<std::vector<at::Tensor>> D, DType D_type, at::Tensor m_splits,
+    std::vector<at::Tensor> bias, DType bias_type, bool single_output,
+    std::vector<at::Tensor> pre_gelu_out, bool grad, bool wgrad,
+    std::vector<at::Tensor> workspace, size_t workspaceSize, bool accumulate,
+    std::optional<at::Tensor> accumulate_mask, bool use_split_accumulator, int math_sm_count);
+
 /***************************************************************************************************
  * Transpose
  **************************************************************************************************/

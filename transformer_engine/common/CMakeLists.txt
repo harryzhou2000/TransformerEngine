@@ -172,6 +172,7 @@ list(APPEND transformer_engine_cuda_arch_specific_sources
      activation/swiglu.cu
      cast/cast.cu
      gemm/cutlass_grouped_gemm.cu
+     gemm/cutlass_device_grouped_gemm.cu
      hadamard_transform/group_hadamard_transform.cu
      hadamard_transform/graph_safe_group_hadamard_transform.cu
      hadamard_transform/hadamard_transform.cu
@@ -242,9 +243,17 @@ set_property(
   PROPERTY
   COMPILE_OPTIONS "--generate-code=arch=compute_90a,code=sm_90a")
 
+# Device-initiated grouped GEMM kernels require SM100a
+set_property(
+  SOURCE gemm/cutlass_device_grouped_gemm.cu
+  APPEND
+  PROPERTY
+  COMPILE_OPTIONS "--generate-code=arch=compute_100a,code=sm_100a")
+
 # CUTLASS kernels could cause hang in debug build
 set(CUTLASS_KERNEL_SOURCES
     gemm/cutlass_grouped_gemm.cu
+    gemm/cutlass_device_grouped_gemm.cu
     hadamard_transform/group_hadamard_transform_cast_fusion.cu
     hadamard_transform/group_row_cast_col_hadamard_transform_cast_fusion.cu
     hadamard_transform/hadamard_transform_cast_fusion.cu)

@@ -84,39 +84,6 @@ __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncT
   return T(val);
 }
 
-template <typename T>
-__device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int data_size,
-                                                ReduceFuncType type, int lane_id) {
-  T (*reduce_func)(T, T);
-  CompType default_val = 0.0;
-  if (type == ReduceFuncType::SUM) {
-    reduce_func = sum;
-    default_val = 0.0;
-  } else if (type == ReduceFuncType::MAX) {
-    reduce_func = max;
-    default_val = -std::numeric_limits<CompType>::infinity();
-  }
-
-  // Some value is handled in local thread
-  // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
-  // Reduce the value in local thread
-  CompType val = lane_id < data_size && mask[lane_id] ? data_ptr[lane_id] : default_val;
-  for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-    if (mask[i]) {
-      val = reduce_func(val, data_ptr[i]);
-    }
-  }
-
-  // Warp shuffle between threads
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 16));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 8));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 4));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 2));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 1));
-  __syncwarp();
-  return T(val);
-}
-
 // ============================================================================
 // Scalar (per-element) score functions — for fused paths
 // ============================================================================
@@ -160,72 +127,8 @@ __device__ __forceinline__ float softmax_bwd_scalar(float grad, float act, float
 }
 
 // ============================================================================
-// Array (in-place on shmem) score functions — original interface
+// Array (in-place on shmem) score functions
 // ============================================================================
-
-__device__ inline void apply_sigmoid_on_float(float *scores, int data_size, int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = sigmoid_scalar(scores[i]);
-  }
-}
-
-__device__ inline void apply_sigmoid_bwd_on_float(float *grad, float *fwd_output, int data_size,
-                                                  int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    grad[i] = grad[i] * fwd_output[i] * (1.0f - fwd_output[i]);
-  }
-}
-
-// sqrtsoftplus: y = sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
-__device__ inline void apply_sqrtsoftplus_on_float(float *scores, int data_size, int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = sqrtsoftplus_scalar(scores[i]);
-  }
-}
-
-// sqrtsoftplus backward:
-// y = sqrt(softplus(x))
-// Matches PyTorch's Softplus(beta=1.0, threshold=20.0)
-// We need the original logits (x) to compute the gradient
-__device__ inline void apply_sqrtsoftplus_bwd_on_float(float *grad, float *fwd_output,
-                                                       float *logits_buf, int data_size,
-                                                       int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    float x = logits_buf[i];  // original logit
-    float y = fwd_output[i];  // sqrtsoftplus output
-    float dy_dx;
-    if (x > 20.0f) {
-      // When softplus(x) = x, y = sqrt(x), dy/dx = 1/(2*y)
-      dy_dx = 1.0f / (2.0f * y + epsilon);
-    } else {
-      // When softplus(x) = log(1+exp(x)), dy/dx = sigmoid(x) / (2*y)
-      // where sigmoid(x) = 1 / (1 + exp(-x))
-      float sigmoid_x = 1.0f / (1.0f + expf(-x));
-      dy_dx = sigmoid_x / (2.0f * y + epsilon);
-    }
-    grad[i] = grad[i] * dy_dx;
-  }
-}
-
-// Softmax backward — no scratch buffer needed.
-// Computes sum(output * grad) via register accumulation + warp shuffle,
-// then updates grad in-place.  `mask` is an optional pointer
-// (nullptr means no masking — all experts active).
-__device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output,
-                                                   const bool *mask, int data_size, int lane_id) {
-  float local_sum = 0.0f;
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    bool active = mask ? mask[i] : true;
-    if (active) {
-      local_sum += grad[i] * fwd_output[i];
-    }
-  }
-  float dot = warp_allreduce_sum(local_sum);
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    bool active = mask ? mask[i] : true;
-    grad[i] = active ? softmax_bwd_scalar(grad[i], fwd_output[i], dot) : 0.0f;
-  }
-}
 
 __device__ inline void apply_softmax_on_float(float *scores, int data_size, int lane_id) {
   // --- Pass 1: Online accumulation of max and sum_exp ---

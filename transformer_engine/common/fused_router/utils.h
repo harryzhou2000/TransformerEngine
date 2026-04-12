@@ -176,33 +176,33 @@ __device__ inline void apply_sqrtsoftplus_bwd_on_float(float *grad, float *fwd_o
   }
 }
 
-__device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output, float *comp_buf,
-                                                  bool *mask, int data_size, int lane_id) {
-  // Put the result of output * grad to the comp_buf
+// Softmax backward — no scratch buffer needed.
+// Computes sum(output * grad) via register accumulation + warp shuffle,
+// then updates grad in-place.  `mask` is an optional global-memory pointer
+// (nullptr means no masking).
+__device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output,
+                                                   const bool *mask, int data_size, int lane_id) {
+  // Accumulate sum(output * grad) in registers
+  float local_sum = 0.0f;
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    if (mask) {
-      if (mask[i])
-        comp_buf[i] = grad[i] * fwd_output[i];
-      else
-        comp_buf[i] = 0.0f;
-    } else {
-      comp_buf[i] = grad[i] * fwd_output[i];
+    bool active = mask ? mask[i] : true;
+    if (active) {
+      local_sum += grad[i] * fwd_output[i];
     }
   }
-  __syncwarp();
-  float sum_Output_x_Grad = warp_reduce_on_shmem(
-      /*data ptr = */ comp_buf,
-      /*data size = */ data_size,
-      /*reduce func = */ ReduceFuncType::SUM, lane_id);
+  // Warp shuffle reduction
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
+  }
+  float sum_Output_x_Grad = local_sum;
   // In-place update
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    if (mask) {
-      if (mask[i])
-        grad[i] = fwd_output[i] * (grad[i] - sum_Output_x_Grad);
-      else
-        grad[i] = 0.0f;
-    } else {
+    bool active = mask ? mask[i] : true;
+    if (active) {
       grad[i] = fwd_output[i] * (grad[i] - sum_Output_x_Grad);
+    } else {
+      grad[i] = 0.0f;
     }
   }
 }

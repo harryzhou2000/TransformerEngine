@@ -323,15 +323,21 @@ void fused_topk_with_score_function_forward(const Tensor logits, int num_tokens,
               reinterpret_cast<CompType *>(intermediate_output.data.dptr), stream);););
 }
 
-// Streaming 1-pass backward (for sigmoid/sqrtsoftplus with topk == 1).
-// When topk == 1, no normalization is needed — pure element-wise ops with no reduction.
-// Single read from global, all computation in registers, single write to global.
+// Streaming backward — zero shmem, persistent grid.
 //
-// Streaming 2-pass backward (for all other cases: topk > 1 or softmax).
-// Pass 1: Read all inputs → compute reduction sums → warp shuffle.
-// Pass 2: Read same inputs (L1-cached) → apply backward → write output.
+// ScoreFunc is templated to eliminate dead code at compile time:
+//   0 = sigmoid:      act stores sigmoid(logit), bwd = y*(1-y)
+//   1 = softmax:      act stores softmax(logit), bwd = y*(dL/dy - sum(y*dL/dy))
+//   2 = sqrtsoftplus: act stores original logit, bwd = sigmoid(x)/(2*sqrt(softplus(x)))
 //
-// score_function is templated to eliminate dead branches at compile time.
+// For sigmoid/sqrtsoftplus with topk > 1, a normalization layer (divide by sum)
+// was applied in the forward.  Its backward requires sum(act) and sum(grad*act)
+// over routed experts, computed in a reduction pass before the element-wise pass.
+//
+// For softmax, the backward always requires sum(output * grad).
+//
+// When no reduction is needed (sigmoid/sqrtsoftplus with topk == 1), the kernel
+// is a single element-wise pass: 1 global read + 1 global write per element.
 template <typename DataType, int ScoreFunc>
 __global__ void fused_topk_with_score_function_backward_kernel(
     const bool *routing_map, const CompType *intermediate_output, const DataType *grad_probs,
@@ -347,39 +353,38 @@ __global__ void fused_topk_with_score_function_backward_kernel(
     if (token_idx >= num_tokens) break;
     int pos = token_idx * num_experts;
 
-    // ---- Pass 1: Compute reduction sums (only when needed) ----
-    CompType sum_act = 0.0f;
-    CompType sum_grad_act = 0.0f;
-    CompType sum_output_x_grad = 0.0f;
+    // ---- Reduction pass (only when normalization or softmax bwd needs it) ----
+    CompType sum_act = 0.0f;           // sum of activation outputs (sigmoid/sqrtsoftplus norm bwd)
+    CompType sum_grad_act = 0.0f;      // sum of grad * act (sigmoid/sqrtsoftplus norm bwd)
+    CompType sum_output_x_grad = 0.0f; // sum of fwd_output * grad (softmax bwd)
 
-    // Sigmoid/sqrtsoftplus normalization bwd needs reductions only when topk > 1
-    bool need_norm_reduce = (ScoreFunc == 0 || ScoreFunc == 2) && topk > 1;
-    // Softmax bwd always needs reduction
-    bool need_softmax_reduce = (ScoreFunc == 1);
+    bool need_reduce = ((ScoreFunc == 0 || ScoreFunc == 2) && topk > 1) || (ScoreFunc == 1);
 
-    if (need_norm_reduce || need_softmax_reduce) {
+    if (need_reduce) {
       for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
         CompType g = static_cast<CompType>(grad_probs[pos + i]) * scaling_factor;
         CompType act = intermediate_output[pos + i];
         bool routed = routing_map[pos + i];
 
         if constexpr (ScoreFunc == 0) {
+          // Sigmoid: act = sigmoid output. Accumulate for routed experts only.
           if (routed) {
             sum_act += act;
             sum_grad_act += g * act;
           }
         } else if constexpr (ScoreFunc == 2) {
+          // Sqrtsoftplus: act = original logit. Compute sqrtsoftplus for reduction.
           if (routed) {
             CompType act_val = sqrtsoftplus_scalar(act);
             sum_act += act_val;
             sum_grad_act += g * act_val;
           }
         } else if constexpr (ScoreFunc == 1) {
+          // Softmax: act = softmax output.
           if (!use_pre_softmax) {
             if (routed) sum_output_x_grad += g * act;
           } else {
-            CompType masked_g = routed ? g : 0.0f;
-            sum_output_x_grad += masked_g * act;
+            sum_output_x_grad += (routed ? g : 0.0f) * act;
           }
         }
       }
@@ -396,19 +401,16 @@ __global__ void fused_topk_with_score_function_backward_kernel(
       }
     }
 
-    // ---- Pass 2 (or only pass if no reduction needed): Apply backward + write ----
+    // ---- Element-wise pass: apply all backward ops + write output ----
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      CompType g = static_cast<CompType>(grad_probs[pos + i]);
+      CompType g = static_cast<CompType>(grad_probs[pos + i]) * scaling_factor;
       CompType act = intermediate_output[pos + i];
       bool routed = routing_map[pos + i];
 
-      g *= scaling_factor;
-
-      // Normalization backward (sigmoid/sqrtsoftplus, topk > 1)
+      // Backward of normalization (sigmoid/sqrtsoftplus with topk > 1)
       if constexpr (ScoreFunc == 0 || ScoreFunc == 2) {
         if (topk > 1) {
-          CompType act_val = act;
-          if constexpr (ScoreFunc == 2) act_val = sqrtsoftplus_scalar(act);
+          CompType act_val = (ScoreFunc == 2) ? sqrtsoftplus_scalar(act) : act;
           if (routed) {
             CompType denom = sum_act + epsilon;
             g = g / denom - sum_grad_act / (denom * denom);
@@ -418,31 +420,31 @@ __global__ void fused_topk_with_score_function_backward_kernel(
         }
       }
 
-      // Post-softmax backward
+      // Backward of post-softmax (applied after topk in forward)
       if constexpr (ScoreFunc == 1) {
         if (!use_pre_softmax) {
           g = routed ? act * (g - sum_output_x_grad) : 0.0f;
         }
       }
 
-      // Topk backward: mask unselected
+      // Backward of topk: zero out non-routed experts
       if (!routed) g = 0.0f;
 
-      // Pre-softmax backward
+      // Backward of pre-softmax (applied before topk in forward)
       if constexpr (ScoreFunc == 1) {
         if (use_pre_softmax) {
           g = act * (g - sum_output_x_grad);
         }
       }
 
-      // Activation backward
+      // Backward of activation function
       if constexpr (ScoreFunc == 0) {
-        g = g * act * (1.0f - act);
+        // Sigmoid backward: act = sigmoid output y, dy/dx = y * (1 - y)
+        g = sigmoid_bwd_scalar(g, act);
       } else if constexpr (ScoreFunc == 2) {
+        // Sqrtsoftplus backward: act = original logit x, y = sqrtsoftplus(x)
         CompType y = sqrtsoftplus_scalar(act);
-        CompType dy_dx = (act > 20.0f) ? (1.0f / (2.0f * y + epsilon))
-                                       : (sigmoid_scalar(act) / (2.0f * y + epsilon));
-        g = g * dy_dx;
+        g = sqrtsoftplus_bwd_scalar(g, act, y);
       }
 
       grad_logits[pos + i] = static_cast<DataType>(g);

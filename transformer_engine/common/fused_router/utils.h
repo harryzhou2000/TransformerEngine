@@ -118,14 +118,29 @@ __device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int dat
 }
 
 // ============================================================================
-// Scalar (per-element) score functions — for fused load+transform paths
+// Scalar (per-element) score functions — for fused paths
 // ============================================================================
 
+// Forward: y = sigmoid(x) = 1 / (1 + exp(-x))
 __device__ __forceinline__ float sigmoid_scalar(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+// Forward: y = sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
 __device__ __forceinline__ float sqrtsoftplus_scalar(float x) {
   float sp = (x > 20.0f) ? x : log1pf(expf(x));
   return sqrtf(sp);
+}
+
+// Backward: sigmoid — given sigmoid output y, dy/dx = y * (1 - y)
+__device__ __forceinline__ float sigmoid_bwd_scalar(float grad, float y) {
+  return grad * y * (1.0f - y);
+}
+
+// Backward: sqrtsoftplus — given original logit x and sqrtsoftplus output y = sqrt(softplus(x)),
+// dy/dx = sigmoid(x) / (2 * y).  For large x (>20), softplus(x) ≈ x so dy/dx ≈ 1/(2*y).
+__device__ __forceinline__ float sqrtsoftplus_bwd_scalar(float grad, float x, float y) {
+  float dy_dx = (x > 20.0f) ? (1.0f / (2.0f * y + epsilon))
+                             : (sigmoid_scalar(x) / (2.0f * y + epsilon));
+  return grad * dy_dx;
 }
 
 // ============================================================================

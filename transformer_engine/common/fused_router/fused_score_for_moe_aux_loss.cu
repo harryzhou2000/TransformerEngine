@@ -186,13 +186,16 @@ void fused_score_for_moe_aux_loss_forward(const Tensor &logits, int num_tokens, 
           reinterpret_cast<CompType *>(intermediate_output.data.dptr), stream););
 }
 
+// Streaming backward for moe_aux_loss — same structure as topk backward.
+// No routing_map: all experts participate in normalization.
+//
+// ScoreFunc: 0 = sigmoid, 1 = softmax, 2 = sqrtsoftplus (see topk backward comments).
 template <typename DataType, int ScoreFunc>
 __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *intermediate_output,
                                                               const float *grad_scores,
                                                               int num_tokens, int num_experts,
                                                               int topk,
                                                               DataType *grad_logits) {
-  // Streaming 2-pass backward, no shmem. score_function templated to eliminate dead code.
   int num_token_per_block = blockDim.x / kThreadsPerWarp;
   int warp_id = threadIdx.x / kThreadsPerWarp;
   int lane_id = threadIdx.x % kThreadsPerWarp;
@@ -203,7 +206,7 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *int
     if (token_idx >= num_tokens) break;
     int pos = token_idx * num_experts;
 
-    // ---- Pass 1: Compute reduction sums ----
+    // ---- Reduction pass ----
     CompType sum_act = 0.0f;
     CompType sum_grad_act = 0.0f;
     CompType sum_output_x_grad = 0.0f;
@@ -213,13 +216,16 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *int
       CompType act = intermediate_output[pos + i];
 
       if constexpr (ScoreFunc == 0) {
+        // Sigmoid: act = sigmoid output
         sum_act += act;
         sum_grad_act += g * act;
       } else if constexpr (ScoreFunc == 2) {
+        // Sqrtsoftplus: act = original logit, compute sqrtsoftplus for reduction
         CompType act_val = sqrtsoftplus_scalar(act);
         sum_act += act_val;
         sum_grad_act += g * act_val;
       } else if constexpr (ScoreFunc == 1) {
+        // Softmax: act = softmax output
         sum_output_x_grad += g * act;
       }
     }
@@ -235,23 +241,24 @@ __global__ void fused_score_for_moe_aux_loss_backward_kernel(const CompType *int
       }
     }
 
-    // ---- Pass 2: Apply backward + write ----
+    // ---- Element-wise pass: apply backward + write ----
     for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
       CompType g = static_cast<CompType>(grad_scores[pos + i]);
       CompType act = intermediate_output[pos + i];
 
       if constexpr (ScoreFunc == 0) {
+        // Sigmoid: normalization bwd then sigmoid bwd
         CompType denom = sum_act + epsilon;
         g = g / denom - sum_grad_act / (denom * denom);
-        g = g * act * (1.0f - act);
+        g = sigmoid_bwd_scalar(g, act);
       } else if constexpr (ScoreFunc == 2) {
-        CompType act_val = sqrtsoftplus_scalar(act);
+        // Sqrtsoftplus: normalization bwd then sqrtsoftplus bwd
+        CompType y = sqrtsoftplus_scalar(act);
         CompType denom = sum_act + epsilon;
         g = g / denom - sum_grad_act / (denom * denom);
-        CompType dy_dx = (act > 20.0f) ? (1.0f / (2.0f * act_val + epsilon))
-                                       : (sigmoid_scalar(act) / (2.0f * act_val + epsilon));
-        g = g * dy_dx;
+        g = sqrtsoftplus_bwd_scalar(g, act, y);
       } else if constexpr (ScoreFunc == 1) {
+        // Softmax backward
         g = act * (g - sum_output_x_grad);
       }
 

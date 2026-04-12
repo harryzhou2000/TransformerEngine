@@ -143,6 +143,22 @@ __device__ __forceinline__ float sqrtsoftplus_bwd_scalar(float grad, float x, fl
   return grad * dy_dx;
 }
 
+// Backward: normalization — given grad, routed flag, and pre-computed sums.
+// Used by sigmoid/sqrtsoftplus with topk > 1.
+// sum_act = sum of activation outputs over routed experts.
+// sum_grad_act = sum of grad * act over routed experts.
+__device__ __forceinline__ float normalize_bwd_scalar(float grad, bool routed, float sum_act,
+                                                      float sum_grad_act) {
+  if (!routed) return 0.0f;
+  float denom = sum_act + epsilon;
+  return grad / denom - sum_grad_act / (denom * denom);
+}
+
+// Backward: softmax element — given grad, softmax output, and sum(output * grad).
+__device__ __forceinline__ float softmax_bwd_scalar(float grad, float act, float dot) {
+  return act * (grad - dot);
+}
+
 // ============================================================================
 // Array (in-place on shmem) score functions — original interface
 // ============================================================================
@@ -193,11 +209,10 @@ __device__ inline void apply_sqrtsoftplus_bwd_on_float(float *grad, float *fwd_o
 
 // Softmax backward — no scratch buffer needed.
 // Computes sum(output * grad) via register accumulation + warp shuffle,
-// then updates grad in-place.  `mask` is an optional global-memory pointer
-// (nullptr means no masking).
+// then updates grad in-place.  `mask` is an optional pointer
+// (nullptr means no masking — all experts active).
 __device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output,
                                                    const bool *mask, int data_size, int lane_id) {
-  // Accumulate sum(output * grad) in registers
   float local_sum = 0.0f;
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
     bool active = mask ? mask[i] : true;
@@ -205,20 +220,10 @@ __device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output
       local_sum += grad[i] * fwd_output[i];
     }
   }
-  // Warp shuffle reduction
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
-  }
-  float sum_Output_x_Grad = local_sum;
-  // In-place update
+  float dot = warp_allreduce_sum(local_sum);
   for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
     bool active = mask ? mask[i] : true;
-    if (active) {
-      grad[i] = fwd_output[i] * (grad[i] - sum_Output_x_Grad);
-    } else {
-      grad[i] = 0.0f;
-    }
+    grad[i] = active ? softmax_bwd_scalar(grad[i], fwd_output[i], dot) : 0.0f;
   }
 }
 

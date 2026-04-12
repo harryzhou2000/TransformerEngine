@@ -176,7 +176,7 @@ class RawAsyncLoader {
 
   // Device-side construction.
   __device__ RawAsyncLoader(T *buf_base, int warp_id, int count, int num_warps, int num_buffers)
-      : count_(count), phase_(0), double_buf_(num_buffers == 2) {
+      : phase_(0), double_buf_(num_buffers == 2) {
     int per_buffer = count * num_warps;
     buf_[0] = buf_base + warp_id * count;
     buf_[1] = (num_buffers == 2) ? buf_base + per_buffer + warp_id * count : buf_[0];
@@ -208,7 +208,6 @@ class RawAsyncLoader {
 
  private:
   T *buf_[2];
-  int count_;
   int phase_;
   bool double_buf_;
 

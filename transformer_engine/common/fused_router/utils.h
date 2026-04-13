@@ -7,10 +7,25 @@
 #ifndef TRANSFORMER_ENGINE_FUSED_ROUTER_UTILS_H_
 #define TRANSFORMER_ENGINE_FUSED_ROUTER_UTILS_H_
 
+#include "../util/logging.h"
+#include "../utils.cuh"
 #include "transformer_engine/transformer_engine.h"
 
 namespace transformer_engine {
 namespace fused_router {
+
+// Check if requested shared memory size exceeds device capacity.
+// Throws an error with num_experts info to help users diagnose the issue.
+inline void check_shared_memory_capacity_num_experts(size_t shared_memory_size, int num_experts) {
+  int device_id;
+  NVTE_CHECK_CUDA(cudaGetDevice(&device_id));
+  int max_smem_per_block;
+  NVTE_CHECK_CUDA(cudaDeviceGetAttribute(&max_smem_per_block,
+                                         cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id));
+  NVTE_CHECK(shared_memory_size <= static_cast<size_t>(max_smem_per_block), "Shared memory size (",
+             shared_memory_size, " bytes) exceeds device capacity (", max_smem_per_block,
+             " bytes). Try reducing num_experts (currently ", num_experts, ").");
+}
 
 // Using FP32 to handle all the calculations.
 // Currently, only FP32 is supported because
@@ -69,122 +84,51 @@ __device__ inline T warp_reduce_on_shmem(T *data_ptr, int data_size, ReduceFuncT
   return T(val);
 }
 
-template <typename T>
-__device__ inline T masked_warp_reduce_on_shmem(T *data_ptr, bool *mask, int data_size,
-                                                ReduceFuncType type, int lane_id) {
-  T (*reduce_func)(T, T);
-  CompType default_val = 0.0;
-  if (type == ReduceFuncType::SUM) {
-    reduce_func = sum;
-    default_val = 0.0;
-  } else if (type == ReduceFuncType::MAX) {
-    reduce_func = max;
-    default_val = -std::numeric_limits<CompType>::infinity();
-  }
+// ============================================================================
+// Scalar (per-element) score functions — for fused paths
+// ============================================================================
 
-  // Some value is handled in local thread
-  // Thread 0 is responsible for the: 0-th, 32-th, 64-th, 96-th ...
-  // Reduce the value in local thread
-  CompType val = lane_id < data_size && mask[lane_id] ? data_ptr[lane_id] : default_val;
-  for (int i = lane_id + kThreadsPerWarp; i < data_size; i += kThreadsPerWarp) {
-    if (mask[i]) {
-      val = reduce_func(val, data_ptr[i]);
-    }
-  }
+// Forward: y = sigmoid(x) = 1 / (1 + exp(-x))
+__device__ __forceinline__ float sigmoid_scalar(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-  // Warp shuffle between threads
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 16));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 8));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 4));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 2));
-  val = reduce_func(val, __shfl_xor_sync(0xffffffff, val, 1));
-  __syncwarp();
-  return T(val);
+// Forward: y = sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
+__device__ __forceinline__ float sqrtsoftplus_scalar(float x) {
+  float sp = (x > 20.0f) ? x : log1pf(expf(x));
+  return sqrtf(sp);
 }
 
-__device__ inline void apply_sigmoid_on_float(float *scores, int data_size, int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    scores[i] = 1.0f / (1.0f + expf(-scores[i]));
-  }
+// Backward: sigmoid — given sigmoid output y, dy/dx = y * (1 - y)
+__device__ __forceinline__ float sigmoid_bwd_scalar(float grad, float y) {
+  return grad * y * (1.0f - y);
 }
 
-__device__ inline void apply_sigmoid_bwd_on_float(float *grad, float *fwd_output, int data_size,
-                                                  int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    grad[i] = grad[i] * fwd_output[i] * (1.0f - fwd_output[i]);
-  }
+// Backward: sqrtsoftplus — given original logit x and sqrtsoftplus output y = sqrt(softplus(x)),
+// dy/dx = sigmoid(x) / (2 * y).  For large x (>20), softplus(x) ≈ x so dy/dx ≈ 1/(2*y).
+__device__ __forceinline__ float sqrtsoftplus_bwd_scalar(float grad, float x, float y) {
+  float dy_dx = (x > 20.0f) ? (1.0f / (2.0f * y + epsilon))
+                             : (sigmoid_scalar(x) / (2.0f * y + epsilon));
+  return grad * dy_dx;
 }
 
-// sqrtsoftplus: y = sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
-__device__ inline void apply_sqrtsoftplus_on_float(float *scores, int data_size, int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    float x = scores[i];
-    // softplus(x) = log(1 + exp(x)), numerically stable version
-    // Matches PyTorch's Softplus(beta=1.0, threshold=20.0)
-    float softplus_val;
-    if (x > 20.0f) {
-      softplus_val = x;  // for large x, softplus(x) ≈ x
-    } else {
-      softplus_val = log1pf(expf(x));
-    }
-    scores[i] = sqrtf(softplus_val);
-  }
+// Backward: normalization — given grad, routed flag, and pre-computed sums.
+// Used by sigmoid/sqrtsoftplus with topk > 1.
+// sum_act = sum of activation outputs over routed experts.
+// sum_grad_act = sum of grad * act over routed experts.
+__device__ __forceinline__ float normalize_bwd_scalar(float grad, bool routed, float sum_act,
+                                                      float sum_grad_act) {
+  if (!routed) return 0.0f;
+  float denom = sum_act + epsilon;
+  return grad / denom - sum_grad_act / (denom * denom);
 }
 
-// sqrtsoftplus backward:
-// y = sqrt(softplus(x))
-// Matches PyTorch's Softplus(beta=1.0, threshold=20.0)
-// We need the original logits (x) to compute the gradient
-__device__ inline void apply_sqrtsoftplus_bwd_on_float(float *grad, float *fwd_output,
-                                                       float *logits_buf, int data_size,
-                                                       int lane_id) {
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    float x = logits_buf[i];  // original logit
-    float y = fwd_output[i];  // sqrtsoftplus output
-    float dy_dx;
-    if (x > 20.0f) {
-      // When softplus(x) = x, y = sqrt(x), dy/dx = 1/(2*y)
-      dy_dx = 1.0f / (2.0f * y + epsilon);
-    } else {
-      // When softplus(x) = log(1+exp(x)), dy/dx = sigmoid(x) / (2*y)
-      // where sigmoid(x) = 1 / (1 + exp(-x))
-      float sigmoid_x = 1.0f / (1.0f + expf(-x));
-      dy_dx = sigmoid_x / (2.0f * y + epsilon);
-    }
-    grad[i] = grad[i] * dy_dx;
-  }
+// Backward: softmax element — given grad, softmax output, and sum(output * grad).
+__device__ __forceinline__ float softmax_bwd_scalar(float grad, float act, float dot) {
+  return act * (grad - dot);
 }
 
-__device__ inline void apply_softmax_bwd_on_float(float *grad, float *fwd_output, float *comp_buf,
-                                                  bool *mask, int data_size, int lane_id) {
-  // Put the result of output * grad to the comp_buf
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    if (mask) {
-      if (mask[i])
-        comp_buf[i] = grad[i] * fwd_output[i];
-      else
-        comp_buf[i] = 0.0f;
-    } else {
-      comp_buf[i] = grad[i] * fwd_output[i];
-    }
-  }
-  __syncwarp();
-  float sum_Output_x_Grad = warp_reduce_on_shmem(
-      /*data ptr = */ comp_buf,
-      /*data size = */ data_size,
-      /*reduce func = */ ReduceFuncType::SUM, lane_id);
-  // In-place update
-  for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
-    if (mask) {
-      if (mask[i])
-        grad[i] = fwd_output[i] * (grad[i] - sum_Output_x_Grad);
-      else
-        grad[i] = 0.0f;
-    } else {
-      grad[i] = fwd_output[i] * (grad[i] - sum_Output_x_Grad);
-    }
-  }
-}
+// ============================================================================
+// Array (in-place on shmem) softmax — still used by forward kernels
+// ============================================================================
 
 __device__ inline void apply_softmax_on_float(float *scores, int data_size, int lane_id) {
   // --- Pass 1: Online accumulation of max and sum_exp ---
@@ -212,8 +156,8 @@ __device__ inline void apply_softmax_on_float(float *scores, int data_size, int 
   // Fix: treat -inf max as "no data" and skip the expf computation.
 #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
-    float other_max = __shfl_xor_sync(0xffffffff, local_max, offset);
-    float other_sum = __shfl_xor_sync(0xffffffff, local_sum, offset);
+    float other_max = warp_shuffle_xor(local_max, offset);
+    float other_sum = warp_shuffle_xor(local_sum, offset);
     float new_max = fmaxf(local_max, other_max);
     if (new_max > -std::numeric_limits<float>::infinity()) {
       // At least one side has real data; safe to compute expf differences
@@ -241,6 +185,11 @@ enum class TopkFuncType {
   Radix = 1,
 };
 
+// Maximum num_experts supported by the packed 8-bit radix topk histogram.
+// Each thread processes ceil(data_size/32) elements per bucket.  With 8-bit
+// counters the max per-thread count is 255, so data_size <= 255 * 32 = 8160.
+constexpr int kMaxExpertsRadixTopk = 255 * 32;  // 8160
+
 /*******************************************************************************
  * radix_topk_and_mask — Warp-level radix-selection based top-K
  *
@@ -266,41 +215,23 @@ enum class TopkFuncType {
  *     broken by ascending index for determinism matching torch.topk).
  *     Write indices and scores to the output arrays.
  *
+ * Register pressure optimization: pack 16 bucket counts into 4 registers
+ * using 8-bit fields (4 counters per u32).  The original counts[16] +
+ * total_counts[16] required 32 registers, causing massive spill to local
+ * memory on large kernels (81% of L1 traffic on E=2304, K=36).
+ *
  * Tie-breaking: (value DESC, index ASC) — matches torch.topk behavior.
  *
  * Constraints:
  *   - 0 < topk <= data_size
- *   - No upper limit on topk or data_size (unlike v1's 128 cap)
+ *   - data_size <= kMaxExpertsRadixTopk (8160) to avoid 8-bit overflow
  *   - scores must be in shared memory accessible by the warp
  *
  * Complexity: 9 × O(E/32) = O(E) per warp, independent of K.
  ******************************************************************************/
 
-// Convert float to an unsigned integer that preserves descending sort order.
-// After conversion, a numerically larger float maps to a larger uint32.
-// This allows bitwise radix selection to find top-K by searching from MSB.
-__device__ inline unsigned int float_to_ordered_uint(float f) {
-  unsigned int u = __float_as_uint(f);
-  // If sign bit is set (negative), flip all bits.
-  // If sign bit is clear (positive or +0), flip only the sign bit.
-  unsigned int mask = (u & 0x80000000u) ? 0xFFFFFFFFu : 0x80000000u;
-  return u ^ mask;
-}
-
-// Convert back from ordered uint to float.
-__device__ inline float ordered_uint_to_float(unsigned int u) {
-  // Reverse the transformation: if MSB is set (was positive), flip sign bit.
-  // If MSB is clear (was negative), flip all bits.
-  unsigned int mask = (u & 0x80000000u) ? 0x80000000u : 0xFFFFFFFFu;
-  return __uint_as_float(u ^ mask);
-}
-
-__device__ inline void radix_topk_and_mask(CompType *scores, int data_size,
-                                                           int topk, int *topk_indices,
-                                                           CompType *topk_scores, int lane_id) {
-  // assert(topk > 0 && "naive_topk_and_mask_v2: topk must be positive");
-  // assert(topk <= data_size && "naive_topk_and_mask_v2: topk exceeds data_size");
-
+__device__ inline void radix_topk_and_mask(CompType *scores, int data_size, int topk,
+                                           int *topk_indices, CompType *topk_scores, int lane_id) {
   constexpr int RADIX_BITS = 4;
   constexpr int RADIX_SIZE = 1 << RADIX_BITS;  // 16 buckets
   constexpr int RADIX_MASK = RADIX_SIZE - 1;   // 0xF
@@ -308,60 +239,58 @@ __device__ inline void radix_topk_and_mask(CompType *scores, int data_size,
 
   // =========================================================================
   // Phase 1: Radix selection — find the bit pattern of the K-th largest value
+  //
+  // Packed counters: 16 bucket counts are stored in 4 × u32 registers using
+  // 8-bit fields (4 counters per register).  Bucket b is in byte (b % 4) of
+  // packed[b / 4].  This reduces register usage from 32 (counts[16] +
+  // total_counts[16]) to 4 registers.
+  //
+  // Max per-thread count per bucket = ceil(data_size / 32).
+  // For E=2304: max 72 — fits in 8 bits (max 255).
+  // Constraint: data_size must be <= kMaxExpertsRadixTopk (8160).
   // =========================================================================
   unsigned int desired = 0;       // accumulated bit pattern of the K-th value
   unsigned int desired_mask = 0;  // bits determined so far
   int k_remaining = topk;         // how many more elements we need to skip
 
+#pragma unroll 1
   for (int pass = NUM_PASSES - 1; pass >= 0; pass--) {
     int digit_pos = pass * RADIX_BITS;
 
-    // Each thread counts elements per bucket that match the desired pattern
-    unsigned int counts[RADIX_SIZE];
-#pragma unroll
-    for (int b = 0; b < RADIX_SIZE; b++) {
-      counts[b] = 0;
-    }
+    // Packed counters: packed[i] holds 4 × 8-bit counts for buckets [4i..4i+3].
+    // Bucket b is in byte (b % 4) of packed[b / 4].
+    unsigned int packed[4] = {0, 0, 0, 0};
 
     for (int i = lane_id; i < data_size; i += kThreadsPerWarp) {
       unsigned int u = float_to_ordered_uint(scores[i]);
-      // Check if this element matches the desired pattern on already-decided bits
       if ((u & desired_mask) == desired) {
         int bucket = (u >> digit_pos) & RADIX_MASK;
-        counts[bucket]++;
+        int pack_idx = bucket >> 2;         // bucket / 4
+        int byte_idx = bucket & 3;          // bucket % 4
+        int shift = byte_idx << 3;          // byte_idx * 8
+        packed[pack_idx] += (1u << shift);  // increment the 8-bit field
       }
     }
 
-    // Warp-reduce each bucket count across all 32 lanes
-    unsigned int total_counts[RADIX_SIZE];
-#pragma unroll
-    for (int b = 0; b < RADIX_SIZE; b++) {
-      unsigned int c = counts[b];
-      // Butterfly reduction
-      c += __shfl_xor_sync(0xffffffff, c, 16);
-      c += __shfl_xor_sync(0xffffffff, c, 8);
-      c += __shfl_xor_sync(0xffffffff, c, 4);
-      c += __shfl_xor_sync(0xffffffff, c, 2);
-      c += __shfl_xor_sync(0xffffffff, c, 1);
-      total_counts[b] = c;  // same value on all lanes after full reduction
-    }
-
-    // Scan buckets from LARGEST digit value (15) to smallest (0).
-    // We're looking for the top-K largest, so we want the highest-valued
-    // bucket first.  Accumulate counts until we find the bucket containing
-    // the k_remaining-th element.
+    // Warp-reduce each bucket, then scan to find the target bucket.
     int target_bucket = 0;
+    int k_remaining_copy = k_remaining;
+#pragma unroll
     for (int b = RADIX_SIZE - 1; b >= 0; b--) {
-      unsigned int bc = total_counts[b];
-      if (bc < static_cast<unsigned int>(k_remaining)) {
-        // All elements in this bucket are in the top set; skip them
-        k_remaining -= bc;
+      // Unpack: extract 8-bit count for bucket b from packed[b/4]
+      int pack_idx = b >> 2;
+      int shift = (b & 3) << 3;
+      unsigned int my_count = (packed[pack_idx] >> shift) & 0xFFu;
+      // Warp-reduce to get total count across all 32 lanes
+      unsigned int bc = warp_allreduce_sum(my_count);
+      if (bc < static_cast<unsigned int>(k_remaining_copy)) {
+        k_remaining_copy -= bc;
       } else {
-        // The K-th element is in this bucket
         target_bucket = b;
         break;
       }
     }
+    k_remaining = k_remaining_copy;
 
     // Update the desired pattern and mask
     desired |= (static_cast<unsigned int>(target_bucket) << digit_pos);
@@ -487,8 +416,9 @@ __device__ inline void naive_topk_and_mask(CompType *scores, int data_size, int 
 }
 
 template <TopkFuncType TopkFunc>
-__device__ __forceinline__ void topk_and_mask(CompType *scores, int data_size, int topk, int *topk_indices,
-                             CompType *topk_scores, int lane_id) {
+__device__ __forceinline__ void topk_and_mask(CompType *scores, int data_size, int topk,
+                                              int *topk_indices, CompType *topk_scores,
+                                              int lane_id) {
   if constexpr (TopkFunc == TopkFuncType::Radix)
     return radix_topk_and_mask(scores, data_size, topk, topk_indices, topk_scores, lane_id);
   else

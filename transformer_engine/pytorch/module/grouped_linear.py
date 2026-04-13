@@ -481,6 +481,7 @@ class _GroupedLinear(torch.autograd.Function):
                         dgrad_gemm_use_split_accumulator = (
                             recipe.fp8_gemm_dgrad.use_split_accumulator
                         )
+                weights_for_dgrad = weights
                 if ctx.m_splits_on_device:
                     dgrad = torch.empty(
                         (inputmats[0].size(0), ctx.weights_shape_1),
@@ -493,7 +494,6 @@ class _GroupedLinear(torch.autograd.Function):
                         dtype=ctx.activation_dtype,
                         device=ctx.device,
                     )
-                    weights_for_dgrad = weights
                     if ctx.backward_override == "dequantized":
                         weights_for_dgrad = [
                             (
@@ -532,7 +532,7 @@ class _GroupedLinear(torch.autograd.Function):
                     )
                 else:
                     general_grouped_gemm(
-                        weights,
+                        weights_for_dgrad,
                         grad_output,
                         [dgrad],
                         ctx.grad_input_quantizers,
@@ -618,7 +618,7 @@ class _GroupedLinear(torch.autograd.Function):
                                 cast_if_needed(inputmat, ctx.activation_dtype)
                             )
                     inputmats = inputmats_dequant
-                    
+
                 if ctx.m_splits_on_device:
                     grouped_gemm_wgrad = functools.partial(
                         device_init_grouped_gemm,

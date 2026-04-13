@@ -10,6 +10,7 @@
 #include <string>
 
 #include "../extensions.h"
+#include "common/common.h"
 #include "common/util/cuda_runtime.h"
 #include "common/util/system.h"
 #include "pybind.h"

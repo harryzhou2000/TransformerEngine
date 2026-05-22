@@ -15,7 +15,7 @@ static std::map<std::string, int> score_function_map = {
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fwd(
     at::Tensor logits, int topk, bool use_pre_softmax, std::optional<int> num_groups,
     std::optional<int> group_topk, std::optional<float> scaling_factor, std::string score_function,
-    std::optional<at::Tensor> expert_bias) {
+    std::optional<at::Tensor> expert_bias, std::optional<at::Tensor> topk_indices) {
   int num_tokens = logits.size(0);
   int num_experts = logits.size(1);
   // Check if the input is valid
@@ -44,35 +44,57 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fw
   // Construct the output tensor
   at::Tensor probs =
       at::empty({num_tokens, num_experts}, at::dtype(logits.scalar_type()).device(at::kCUDA));
-  at::Tensor routing_map =
-      at::empty({num_tokens, num_experts}, at::dtype(at::kBool).device(at::kCUDA));
+  bool use_dense_indices = topk_indices.has_value();
+  at::Tensor routing_output;
+  if (use_dense_indices) {
+    routing_output = topk_indices.value();
+    TORCH_CHECK(routing_output.is_cuda(), "topk_indices must be a CUDA tensor");
+    TORCH_CHECK(routing_output.is_contiguous(), "topk_indices must be contiguous");
+    TORCH_CHECK(routing_output.dim() == 2 && routing_output.size(0) == num_tokens &&
+                    routing_output.size(1) == topk,
+                "topk_indices must have shape [num_tokens, topk]");
+    TORCH_CHECK(routing_output.scalar_type() == at::kShort ||
+                    routing_output.scalar_type() == at::kInt ||
+                    routing_output.scalar_type() == at::kLong,
+                "topk_indices must have dtype torch.int16, torch.int32, or torch.int64");
+  } else {
+    routing_output = at::empty({num_tokens, num_experts}, at::dtype(at::kBool).device(at::kCUDA));
+  }
   // Intermediate output is used to store the output of the softmax/sigmoid function
   at::Tensor intermediate_output =
       at::empty({num_tokens, num_experts}, at::dtype(at::kFloat).device(at::kCUDA));
 
   auto logits_cu = makeTransformerEngineTensor(logits);
   auto probs_cu = makeTransformerEngineTensor(probs);
-  auto routing_map_cu = makeTransformerEngineTensor(routing_map);
+  auto routing_output_cu = makeTransformerEngineTensor(routing_output);
   auto intermediate_output_cu = makeTransformerEngineTensor(intermediate_output);
   auto expert_bias_cu = TensorWrapper();  // empty expert_bias_cu tensor
   if (expert_bias.has_value()) {
     expert_bias_cu = makeTransformerEngineTensor(expert_bias.value());
   }
 
-  nvte_fused_topk_with_score_function_forward(
-      logits_cu.data(), num_tokens, num_experts, topk, use_pre_softmax, num_groups_value,
-      group_topk_value, scaling_factor_value, score_function_map[score_function],
-      expert_bias_cu.data(), probs_cu.data(), routing_map_cu.data(), intermediate_output_cu.data(),
-      at::cuda::getCurrentCUDAStream());
+  if (use_dense_indices) {
+    nvte_fused_topk_with_score_function_forward_with_indices(
+        logits_cu.data(), num_tokens, num_experts, topk, use_pre_softmax, num_groups_value,
+        group_topk_value, scaling_factor_value, score_function_map[score_function],
+        expert_bias_cu.data(), probs_cu.data(), routing_output_cu.data(),
+        intermediate_output_cu.data(), at::cuda::getCurrentCUDAStream());
+  } else {
+    nvte_fused_topk_with_score_function_forward(
+        logits_cu.data(), num_tokens, num_experts, topk, use_pre_softmax, num_groups_value,
+        group_topk_value, scaling_factor_value, score_function_map[score_function],
+        expert_bias_cu.data(), probs_cu.data(), routing_output_cu.data(),
+        intermediate_output_cu.data(), at::cuda::getCurrentCUDAStream());
+  }
 
-  return std::make_tuple(probs, routing_map, intermediate_output);
+  return std::make_tuple(probs, routing_output, intermediate_output);
 }
 
 void fused_topk_with_score_function_bwd(int num_tokens, int num_experts, at::Tensor routing_map,
                                         at::Tensor intermediate_output, at::Tensor grad_probs,
                                         at::Tensor grad_logits, int topk, bool use_pre_softmax,
                                         std::optional<float> scaling_factor,
-                                        std::string score_function) {
+                                        std::string score_function, bool use_dense_indices) {
   // Get the value of the parameters
   auto scaling_factor_value = scaling_factor.has_value() ? scaling_factor.value() : 1.0f;
   auto score_function_value = score_function_map[score_function];
@@ -82,10 +104,17 @@ void fused_topk_with_score_function_bwd(int num_tokens, int num_experts, at::Ten
   auto grad_probs_cu = makeTransformerEngineTensor(grad_probs);
   auto grad_logits_cu = makeTransformerEngineTensor(grad_logits);
 
-  nvte_fused_topk_with_score_function_backward(
-      routing_map_cu.data(), intermediate_output_cu.data(), grad_probs_cu.data(), num_tokens,
-      num_experts, topk, use_pre_softmax, scaling_factor_value, score_function_value,
-      grad_logits_cu.data(), at::cuda::getCurrentCUDAStream());
+  if (use_dense_indices) {
+    nvte_fused_topk_with_score_function_backward_with_indices(
+        routing_map_cu.data(), intermediate_output_cu.data(), grad_probs_cu.data(), num_tokens,
+        num_experts, topk, use_pre_softmax, scaling_factor_value, score_function_value,
+        grad_logits_cu.data(), at::cuda::getCurrentCUDAStream());
+  } else {
+    nvte_fused_topk_with_score_function_backward(
+        routing_map_cu.data(), intermediate_output_cu.data(), grad_probs_cu.data(), num_tokens,
+        num_experts, topk, use_pre_softmax, scaling_factor_value, score_function_value,
+        grad_logits_cu.data(), at::cuda::getCurrentCUDAStream());
+  }
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_score_for_moe_aux_loss_fwd(

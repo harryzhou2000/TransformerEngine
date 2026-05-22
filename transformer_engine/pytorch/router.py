@@ -36,6 +36,7 @@ class FusedTopkScoreFunction(torch.autograd.Function):
         scaling_factor: Optional[float],
         score_function: str,
         expert_bias: Optional[torch.Tensor],
+        topk_indices: Optional[torch.Tensor],
     ):
         # pylint: disable=missing-function-docstring
         # Save the shape of the logits
@@ -44,7 +45,7 @@ class FusedTopkScoreFunction(torch.autograd.Function):
         # Get the metadata of the viewed logits
         num_tokens = logits.size(0)
         num_experts = logits.size(1)
-        probs, routing_map, intermediate_output = tex.fused_topk_with_score_function_fwd(
+        probs, routing_output, intermediate_output = tex.fused_topk_with_score_function_fwd(
             logits,
             topk,
             use_pre_softmax,
@@ -53,10 +54,15 @@ class FusedTopkScoreFunction(torch.autograd.Function):
             scaling_factor,
             score_function,
             expert_bias,
+            topk_indices,
         )
+        if topk_indices is not None:
+            routing_output = topk_indices
         # Restore the shape
         probs = probs.view(tensor_shape)
-        ctx.save_for_backward(routing_map, intermediate_output)
+        if topk_indices is not None:
+            ctx.mark_dirty(topk_indices)
+        ctx.save_for_backward(routing_output, intermediate_output)
         ctx.num_tokens = num_tokens
         ctx.num_experts = num_experts
         ctx.use_pre_softmax = use_pre_softmax
@@ -64,7 +70,8 @@ class FusedTopkScoreFunction(torch.autograd.Function):
         ctx.scaling_factor = scaling_factor
         ctx.score_function = score_function
         ctx.logits_dtype = logits.dtype
-        return probs, routing_map
+        ctx.use_dense_indices = topk_indices is not None
+        return probs, routing_output
 
     @staticmethod
     def backward(ctx, grad_probs, _):
@@ -88,10 +95,11 @@ class FusedTopkScoreFunction(torch.autograd.Function):
             ctx.use_pre_softmax,
             ctx.scaling_factor,
             ctx.score_function,
+            ctx.use_dense_indices,
         )
         # Restore the shape
         grad_logits = grad_logits.view(tensor_shape)
-        return grad_logits, None, None, None, None, None, None, None
+        return grad_logits, None, None, None, None, None, None, None, None
 
 
 def fused_topk_with_score_function(
@@ -103,6 +111,7 @@ def fused_topk_with_score_function(
     scaling_factor: Optional[float],
     score_function: str,
     expert_bias: Optional[torch.Tensor],
+    topk_indices: Optional[torch.Tensor] = None,
 ):
     """
     Fused topk with score function router.
@@ -121,11 +130,14 @@ def fused_topk_with_score_function(
         currently support "softmax", "sigmoid" and "sqrtsoftplus".
     expert_bias : torch.Tensor, optional
         could be used with the sigmoid/sqrtsoftplus score functions.
+    topk_indices : torch.Tensor, optional
+        Optional output buffer with shape [num_tokens, topk]. When provided, its dtype
+        controls the dense index output dtype and the bool routing map is not materialized.
 
     Returns
     -------
     probs : torch.Tensor in the same dtype as the "logits".
-    routing_map : torch.Tensor in bool.
+    routing_map : torch.Tensor in bool, or dense top-k indices when topk_indices is provided.
     """
     if logits.dtype == torch.float64:
         raise ValueError("Current TE does not support float64 router type.")
@@ -138,6 +150,7 @@ def fused_topk_with_score_function(
         scaling_factor,
         score_function,
         expert_bias,
+        topk_indices,
     )
 
 

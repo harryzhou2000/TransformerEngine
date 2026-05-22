@@ -963,153 +963,89 @@ void fused_topk_with_score_function_backward(const Tensor &routing_map,
           reinterpret_cast<DataType *>(grad_logits.data.dptr), stream););
 }
 
-template <typename IndexType>
-__device__ __forceinline__ bool dense_topk_contains(const IndexType *topk_indices, int topk,
-                                                    int expert_idx) {
-  for (int k = 0; k < topk; ++k) {
-    if (static_cast<int>(topk_indices[k]) == expert_idx) return true;
-  }
-  return false;
-}
-
 template <typename DataType, typename IndexType, int ScoreFunc>
-__global__ void fused_topk_with_score_function_backward_with_indices_kernel(
+__global__ void fused_topk_backward_selected_indices_kernel(
     const IndexType *topk_indices, const CompType *intermediate_output, const DataType *grad_probs,
     int num_tokens, int num_experts, int topk, bool use_pre_softmax, float scaling_factor,
-    DataType *grad_logits, int num_buffers) {
+    DataType *grad_logits) {
   int num_token_per_block = blockDim.x / kThreadsPerWarp;
   int warp_id = threadIdx.x / kThreadsPerWarp;
   int lane_id = threadIdx.x % kThreadsPerWarp;
-
-  extern __shared__ char shmem_bwd_indices[];
-  char *shmem_ptr = shmem_bwd_indices;
-
-  DataType *grad_shmem_base = reinterpret_cast<DataType *>(shmem_ptr);
-  RawAsyncLoader<DataType> grad_loader(grad_shmem_base, warp_id, num_experts, num_token_per_block,
-                                       num_buffers);
-  shmem_ptr += RawAsyncLoader<DataType>::shmem_bytes(num_experts, num_token_per_block, num_buffers);
-
-  CompType *act_shmem_base = reinterpret_cast<CompType *>(shmem_ptr);
-  RawAsyncLoader<CompType> act_loader(act_shmem_base, warp_id, num_experts, num_token_per_block,
-                                      num_buffers);
-
   int total_round = (num_tokens + num_token_per_block - 1) / num_token_per_block;
-  int first_round = blockIdx.x;
-  if (first_round >= total_round) return;
 
-  {
-    int first_token = first_round * num_token_per_block + warp_id;
-    if (first_token < num_tokens) {
-      int pos = first_token * num_experts;
-      grad_loader.load_current(grad_probs + pos, num_experts, lane_id);
-      act_loader.load_current(intermediate_output + pos, num_experts, lane_id);
-    }
-  }
-
-  for (int round = first_round; round < total_round; round += gridDim.x) {
+  for (int round = blockIdx.x; round < total_round; round += gridDim.x) {
     int token_idx = round * num_token_per_block + warp_id;
     if (token_idx >= num_tokens) break;
+
     int pos = token_idx * num_experts;
     const IndexType *token_topk_indices = topk_indices + token_idx * topk;
-
-    if (num_buffers == 1 && round != first_round) {
-      grad_loader.load_current(grad_probs + pos, num_experts, lane_id);
-      act_loader.load_current(intermediate_output + pos, num_experts, lane_id);
-    }
-
-    grad_loader.wait();
-    act_loader.wait();
-
-    DataType *raw_grad = grad_loader.current_buf();
-    CompType *local_act = act_loader.current_buf();
-
-    if (num_buffers > 1) {
-      int next_round = round + gridDim.x;
-      if (next_round < total_round) {
-        int next_token = next_round * num_token_per_block + warp_id;
-        if (next_token < num_tokens) {
-          int next_pos = next_token * num_experts;
-          grad_loader.start_load(grad_probs + next_pos, num_experts, lane_id);
-          act_loader.start_load(intermediate_output + next_pos, num_experts, lane_id);
-        }
-      }
-    }
 
     CompType sum_act = 0.0f;
     CompType sum_grad_act = 0.0f;
     CompType sum_output_x_grad = 0.0f;
 
-    bool need_reduce = ((ScoreFunc == 0 || ScoreFunc == 2) && topk > 1) || (ScoreFunc == 1);
-    if (need_reduce) {
-      for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-        CompType g = static_cast<CompType>(raw_grad[i]) * scaling_factor;
-        CompType act = local_act[i];
-        bool routed = dense_topk_contains(token_topk_indices, topk, i);
+    if (topk > 1 || ScoreFunc == 1) {
+      for (int k = lane_id; k < topk; k += kThreadsPerWarp) {
+        int expert_idx = static_cast<int>(token_topk_indices[k]);
+        CompType g = static_cast<CompType>(grad_probs[pos + expert_idx]) * scaling_factor;
+        CompType act = intermediate_output[pos + expert_idx];
 
         if constexpr (ScoreFunc == 0) {
-          if (routed) {
-            sum_act += act;
-            sum_grad_act += g * act;
-          }
+          sum_act += act;
+          sum_grad_act += g * act;
         } else if constexpr (ScoreFunc == 2) {
-          if (routed) {
-            CompType v = sqrtsoftplus_scalar(act);
-            sum_act += v;
-            sum_grad_act += g * v;
-          }
+          CompType v = sqrtsoftplus_scalar(act);
+          sum_act += v;
+          sum_grad_act += g * v;
         } else if constexpr (ScoreFunc == 1) {
-          if (!use_pre_softmax) {
-            if (routed) sum_output_x_grad += g * act;
-          } else {
-            sum_output_x_grad += (routed ? g : 0.0f) * act;
-          }
+          sum_output_x_grad += g * act;
         }
       }
       if constexpr (ScoreFunc == 0 || ScoreFunc == 2) {
         sum_act = warp_allreduce_sum(sum_act);
         sum_grad_act = warp_allreduce_sum(sum_grad_act);
-      }
-      if constexpr (ScoreFunc == 1) {
+      } else if constexpr (ScoreFunc == 1) {
         sum_output_x_grad = warp_allreduce_sum(sum_output_x_grad);
       }
     }
 
-    for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
-      CompType g = static_cast<CompType>(raw_grad[i]) * scaling_factor;
-      CompType act = local_act[i];
-      bool routed = dense_topk_contains(token_topk_indices, topk, i);
-
-      if constexpr (ScoreFunc == 0 || ScoreFunc == 2) {
-        if (topk > 1) {
-          g = normalize_bwd_scalar(g, routed, sum_act, sum_grad_act);
+    if constexpr (ScoreFunc == 1) {
+      if (use_pre_softmax) {
+        for (int i = lane_id; i < num_experts; i += kThreadsPerWarp) {
+          CompType act = intermediate_output[pos + i];
+          grad_logits[pos + i] = static_cast<DataType>(
+              softmax_bwd_scalar(0.0f, act, sum_output_x_grad));
         }
+      } else {
+        vec_fill_global(grad_logits + pos, static_cast<DataType>(0.0f), num_experts, lane_id);
       }
+    } else {
+      vec_fill_global(grad_logits + pos, static_cast<DataType>(0.0f), num_experts, lane_id);
+    }
+    __syncwarp();
 
-      if constexpr (ScoreFunc == 1) {
-        if (!use_pre_softmax) {
-          g = routed ? softmax_bwd_scalar(g, act, sum_output_x_grad) : 0.0f;
-        }
-      }
-
-      if (!routed) g = 0.0f;
-
-      if constexpr (ScoreFunc == 1) {
-        if (use_pre_softmax) {
-          g = softmax_bwd_scalar(g, act, sum_output_x_grad);
-        }
-      }
+    for (int k = lane_id; k < topk; k += kThreadsPerWarp) {
+      int expert_idx = static_cast<int>(token_topk_indices[k]);
+      CompType g = static_cast<CompType>(grad_probs[pos + expert_idx]) * scaling_factor;
+      CompType act = intermediate_output[pos + expert_idx];
 
       if constexpr (ScoreFunc == 0) {
+        if (topk > 1) {
+          g = normalize_bwd_scalar(g, true, sum_act, sum_grad_act);
+        }
         g = sigmoid_bwd_scalar(g, act);
       } else if constexpr (ScoreFunc == 2) {
-        g = sqrtsoftplus_bwd_scalar(g, act, sqrtsoftplus_scalar(act));
+        CompType v = sqrtsoftplus_scalar(act);
+        if (topk > 1) {
+          g = normalize_bwd_scalar(g, true, sum_act, sum_grad_act);
+        }
+        g = sqrtsoftplus_bwd_scalar(g, act, v);
+      } else if constexpr (ScoreFunc == 1) {
+        g = softmax_bwd_scalar(g, act, sum_output_x_grad);
       }
 
-      grad_logits[pos + i] = static_cast<DataType>(g);
+      grad_logits[pos + expert_idx] = static_cast<DataType>(g);
     }
-
-    grad_loader.flip();
-    act_loader.flip();
   }
 }
 
@@ -1125,38 +1061,29 @@ void fused_topk_with_score_function_backward_with_indices_kernel_launcher(
   size_t num_token_per_block = kThreadsPerBlock / kThreadsPerWarp;
   size_t total_blocks = (num_tokens + num_token_per_block - 1) / num_token_per_block;
 
-  size_t single_buf_shmem =
-      RawAsyncLoader<DataType>::shmem_bytes(num_experts, num_token_per_block, 1) +
-      RawAsyncLoader<CompType>::shmem_bytes(num_experts, num_token_per_block, 1);
-  int num_buffers = choose_num_buffers(single_buf_shmem, 0);
-  size_t shmem_bytes =
-      RawAsyncLoader<DataType>::shmem_bytes(num_experts, num_token_per_block, num_buffers) +
-      RawAsyncLoader<CompType>::shmem_bytes(num_experts, num_token_per_block, num_buffers);
-  check_shared_memory_capacity_num_experts(shmem_bytes, num_experts);
-
-  auto launch = [&](auto kernel) {
-    NVTE_CHECK_CUDA(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes));
-    size_t grid_size = compute_persistent_grid(kernel, kThreadsPerBlock, shmem_bytes, total_blocks);
-    kernel<<<grid_size, kThreadsPerBlock, shmem_bytes, stream>>>(
-        topk_indices, intermediate_output, grad_probs, num_tokens, num_experts, topk,
-        use_pre_softmax, scaling_factor, grad_logits, num_buffers);
+  auto launch_selected_indices = [&](auto kernel) {
+    size_t grid_size = compute_persistent_grid(kernel, kThreadsPerBlock, 0, total_blocks);
+    kernel<<<grid_size, kThreadsPerBlock, 0, stream>>>(topk_indices, intermediate_output,
+                                                       grad_probs, num_tokens, num_experts, topk,
+                                                       use_pre_softmax, scaling_factor,
+                                                       grad_logits);
     NVTE_CHECK_CUDA(cudaGetLastError());
   };
 
-  switch (score_function) {
-    case 0:
-      launch(fused_topk_with_score_function_backward_with_indices_kernel<DataType, IndexType, 0>);
-      break;
-    case 1:
-      launch(fused_topk_with_score_function_backward_with_indices_kernel<DataType, IndexType, 1>);
-      break;
-    case 2:
-      launch(fused_topk_with_score_function_backward_with_indices_kernel<DataType, IndexType, 2>);
-      break;
-    default:
-      NVTE_ERROR("Unsupported score_function: " + std::to_string(score_function));
+  if (score_function == 0) {
+    launch_selected_indices(fused_topk_backward_selected_indices_kernel<DataType, IndexType, 0>);
+    return;
   }
+  if (score_function == 2) {
+    launch_selected_indices(fused_topk_backward_selected_indices_kernel<DataType, IndexType, 2>);
+    return;
+  }
+  if (score_function == 1) {
+    launch_selected_indices(fused_topk_backward_selected_indices_kernel<DataType, IndexType, 1>);
+    return;
+  }
+
+  NVTE_ERROR("Unsupported score_function: " + std::to_string(score_function));
 }
 
 void fused_topk_with_score_function_backward_with_indices(

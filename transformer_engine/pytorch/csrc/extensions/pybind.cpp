@@ -129,15 +129,6 @@ void init_extension() {
   });
 }
 
-void bind_quantize_with_amax_extensions(py::module_ &m) {
-  m.def("nvfp4_quantize_with_amax", nvfp4_quantize_with_amax, py::arg("tensor"),
-        py::arg("quantizer"), py::arg("rowwise_amax"), py::arg("columnwise_amax"));
-  m.def("nvfp4_group_quantize_with_amax", nvfp4_group_quantize_with_amax, py::arg("tensor"),
-        py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"),
-        py::arg("last_dims") = py::none(), py::arg("rowwise_amax"), py::arg("columnwise_amax"),
-        py::arg("tensor_offsets") = py::none());
-}
-
 // Pybind11 registrations for the fused MoE router kernels. Split out of
 // PYBIND11_MODULE() to keep that function under the cpplint readability/fn_size
 // limit.
@@ -175,6 +166,15 @@ void init_router_bindings(pybind11::module &m) {
   m.def("fused_moe_aux_loss_bwd", &fused_moe_aux_loss_bwd, py::arg("Const_buf"),
         py::arg("tokens_per_expert"), py::arg("num_rows"), py::arg("num_cols"),
         py::arg("grad_aux_loss"), "Fused aux loss bwd");
+}
+
+void bind_quantize_with_amax_extensions(py::module_ &m) {
+  m.def("nvfp4_quantize_with_amax", nvfp4_quantize_with_amax, py::arg("tensor"),
+        py::arg("quantizer"), py::arg("rowwise_amax"), py::arg("columnwise_amax"));
+  m.def("nvfp4_group_quantize_with_amax", nvfp4_group_quantize_with_amax, py::arg("tensor"),
+        py::arg("quantizer"), py::arg("num_tensors"), py::arg("first_dims"),
+        py::arg("last_dims") = py::none(), py::arg("rowwise_amax"), py::arg("columnwise_amax"),
+        py::arg("tensor_offsets") = py::none());
 }
 
 }  // namespace transformer_engine::pytorch

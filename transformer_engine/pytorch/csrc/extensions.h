@@ -34,21 +34,19 @@ namespace transformer_engine::pytorch {
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_topk_with_score_function_fwd(
     at::Tensor logits, int topk, bool use_pre_softmax, std::optional<int> num_groups,
     std::optional<int> group_topk, std::optional<float> scaling_factor, std::string score_function,
-    std::optional<at::Tensor> expert_bias,
-    int routing_map_format = static_cast<int>(NVTE_ROUTING_MAP_FORMAT_BYTEMAP),
-    std::optional<at::Tensor> topk_indices = std::nullopt);
+    std::optional<at::Tensor> expert_bias);
 
-void fused_topk_with_score_function_bwd(
-    at::Tensor routing_map, at::Tensor intermediate_output, at::Tensor grad_probs,
-    at::Tensor grad_logits, int topk, bool use_pre_softmax, std::optional<float> scaling_factor,
-    std::string score_function, bool use_dense_indices = false,
-    int routing_map_format = static_cast<int>(NVTE_ROUTING_MAP_FORMAT_BYTEMAP));
+void fused_topk_with_score_function_bwd(int num_tokens, int num_experts, at::Tensor routing_map,
+                                        at::Tensor intermediate_output, at::Tensor grad_probs,
+                                        at::Tensor grad_logits, int topk, bool use_pre_softmax,
+                                        std::optional<float> scaling_factor,
+                                        std::string score_function);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_score_for_moe_aux_loss_fwd(
-    at::Tensor logits, int topk, std::string score_function,
-    int routing_map_format = static_cast<int>(NVTE_ROUTING_MAP_FORMAT_BYTEMAP));
+    at::Tensor logits, int topk, std::string score_function);
 
-void fused_score_for_moe_aux_loss_bwd(at::Tensor intermediate_output, at::Tensor grad_scores,
+void fused_score_for_moe_aux_loss_bwd(int num_tokens, int num_experts,
+                                      at::Tensor intermediate_output, at::Tensor grad_probs,
                                       at::Tensor grad_logits, int topk, std::string score_function);
 
 std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
@@ -56,10 +54,6 @@ std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd(at::Tensor probs,
                                                           int total_num_tokens, int num_experts,
                                                           int num_rows, int num_cols, int topk,
                                                           float coeff);
-
-std::tuple<at::Tensor, at::Tensor> fused_moe_aux_loss_fwd_graph_safe(
-    at::Tensor probs, at::Tensor tokens_per_expert, at::Tensor total_num_tokens, int num_experts,
-    int num_rows, int num_cols, int topk, float coeff);
 
 at::Tensor fused_moe_aux_loss_bwd(at::Tensor Const_buf, at::Tensor tokens_per_expert, int num_rows,
                                   int num_cols, at::Tensor grad_aux_loss);
